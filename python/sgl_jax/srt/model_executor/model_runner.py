@@ -2,6 +2,7 @@
 
 import logging
 from functools import partial
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -41,6 +42,9 @@ from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 
 logger = logging.getLogger(__name__)
 
@@ -517,6 +521,46 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         with jax.profiler.TraceAnnotation("_forward_raw"):
             ret = self._forward_raw(forward_batch, logits_metadata)
         return ret
+
+    def prepare_inmodel_multimodal_forward(
+        self,
+        model_worker_batch: "ModelWorkerBatch",
+        forward_batch: ForwardBatch,
+    ) -> None:
+        if not forward_batch.forward_mode.is_extend():
+            return
+
+        mm_items_by_rank = getattr(model_worker_batch, "mm_items_by_rank", None)
+        if not mm_items_by_rank or not any(mm_items_by_rank):
+            return
+
+        rank_vision_rows = getattr(model_worker_batch, "rank_vision_rows", None)
+        if rank_vision_rows is None:
+            rank_vision_rows = [0 for _ in mm_items_by_rank]
+        if not any(int(rows) > 0 for rows in rank_vision_rows):
+            return
+
+        model = self.model
+        encode_mm = getattr(model, "encode_mm", None)
+        merge_mm = getattr(model, "merge_mm", None)
+        if not callable(encode_mm) or not callable(merge_mm):
+            return
+
+        image_token_id = getattr(model, "image_token_id", None)
+        if image_token_id is None:
+            image_token_id = getattr(self.model_config, "image_token_id", None)
+        if image_token_id is None:
+            return
+
+        vision_features = encode_mm(
+            mm_items_by_rank=mm_items_by_rank,
+            rank_vision_rows=rank_vision_rows,
+        )
+        forward_batch.input_embedding = merge_mm(
+            input_ids=forward_batch.input_ids,
+            placeholder_values={int(image_token_id)},
+            vision_features=vision_features,
+        )
 
     def _forward_raw(
         self,

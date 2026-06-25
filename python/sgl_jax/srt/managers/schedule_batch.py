@@ -2652,6 +2652,7 @@ class ScheduleBatch:
         mrope_positions = _mm["mrope_positions"]
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
+        mm_items_by_rank, rank_vision_rows = _build_mm_sidecars(self.reqs_info, self.dp_size)
 
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
@@ -2756,6 +2757,8 @@ class ScheduleBatch:
             per_dp_bs_size=per_dp_bs_padding,
             launch_done=self.launch_done,
             input_embedding=input_embedding,
+            mm_items_by_rank=mm_items_by_rank,
+            rank_vision_rows=rank_vision_rows,
             apply_for_deepstack=apply_for_deepstack,
             deepstack_visual_embedding=deepstack_visual_embedding,
             recurrent_indices=recurrent_indices_cpu,
@@ -2954,6 +2957,54 @@ def _extract_mm_value(mm_inputs: Any, key: str):
     if isinstance(mm_inputs, dict):
         return mm_inputs.get(key)
     return getattr(mm_inputs, key, None)
+
+
+def _count_mm_item_rows(item: Any) -> int:
+    offsets = getattr(item, "offsets", None)
+    if offsets is None and isinstance(item, dict):
+        offsets = item.get("offsets")
+    if offsets is None:
+        return 0
+    return sum(int(end) - int(start) + 1 for start, end in offsets)
+
+
+def _is_image_mm_item(item: Any) -> bool:
+    modality = getattr(item, "modality", None)
+    if modality is None and isinstance(item, dict):
+        modality = item.get("modality")
+    if hasattr(modality, "value"):
+        modality = modality.value
+    return modality == "image"
+
+
+def _build_mm_sidecars(
+    reqs_info: list[ScheduleReqsInfo] | None,
+    dp_size: int,
+) -> tuple[list[list[Any]] | None, list[int] | None]:
+    mm_items_by_rank: list[list[Any]] = [[] for _ in range(dp_size)]
+    rank_vision_rows = [0 for _ in range(dp_size)]
+    has_mm_items = False
+
+    for dp_rank in range(dp_size):
+        if not reqs_info or dp_rank >= len(reqs_info):
+            continue
+        info = reqs_info[dp_rank]
+        if not info.reqs:
+            continue
+        for req in info.reqs:
+            mm_items = _extract_mm_value(getattr(req, "mm_inputs", None), "mm_items") or []
+            if not mm_items:
+                continue
+            mm_items = [item for item in mm_items if _is_image_mm_item(item)]
+            if not mm_items:
+                continue
+            has_mm_items = True
+            mm_items_by_rank[dp_rank].extend(mm_items)
+            rank_vision_rows[dp_rank] += sum(_count_mm_item_rows(item) for item in mm_items)
+
+    if not has_mm_items:
+        return None, None
+    return mm_items_by_rank, rank_vision_rows
 
 
 def _as_int_scalar(value: Any, default: int = 0) -> int:
@@ -3198,6 +3249,9 @@ class ModelWorkerBatch:
     tree_cache: BasePrefixCache = None
 
     input_embedding: np.ndarray | None = None
+    # Host-only in-model multimodal sidecars. These stay out of ForwardBatch.
+    mm_items_by_rank: list[list[Any]] | None = None
+    rank_vision_rows: list[int] | None = None
     apply_for_deepstack: bool = False
     deepstack_visual_embedding: np.ndarray | None = None
 

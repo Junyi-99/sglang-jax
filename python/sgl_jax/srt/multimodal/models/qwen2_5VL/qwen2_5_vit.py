@@ -73,6 +73,7 @@ def vision_attention(
     v: jax.Array,
     scale: float,
     window_size: int = -1,
+    valid_token_count: jax.Array | None = None,
 ) -> jax.Array:
     """
     Compute vision attention using flash attention on GPU or native attention on TPU.
@@ -87,7 +88,7 @@ def vision_attention(
     Returns:
         Output tensor of shape [B, T, N, H]
     """
-    if not is_tpu_runtime():
+    if not is_tpu_runtime() and valid_token_count is None:
         # GPU: use flash_mha
         flash_mha = _get_flash_mha()
         original_dtype = q.dtype
@@ -127,6 +128,23 @@ def vision_attention(
             window_mask = distance > window_size
             attn_weights = jnp.where(
                 window_mask[None, None, :, :], jnp.finfo(attn_weights.dtype).min, attn_weights
+            )
+
+        if valid_token_count is not None:
+            valid_token_count = jnp.reshape(valid_token_count, ())[()]
+            positions = jnp.arange(T)
+            valid_queries = positions < valid_token_count
+            valid_keys = positions < valid_token_count
+            safe_key0 = positions == 0
+            padding_mask = jnp.where(
+                valid_queries[:, None],
+                valid_keys[None, :],
+                safe_key0[None, :],
+            )
+            attn_weights = jnp.where(
+                padding_mask[None, None, :, :],
+                attn_weights,
+                jnp.finfo(attn_weights.dtype).min,
             )
 
         attn_weights = jax.nn.softmax(attn_weights, axis=-1)
@@ -267,6 +285,7 @@ class Qwen2_5_VisionAttention(nnx.Module):
         rotary_pos_emb: jax.Array,
         cu_window_seqlens: jax.Array | None = None,
         use_fullattn: bool = True,
+        valid_token_count: jax.Array | None = None,
     ) -> jax.Array:
         T, B, D = x.shape
         assert B == 1, "Vision attention currently only supports batch size 1"
@@ -290,7 +309,14 @@ class Qwen2_5_VisionAttention(nnx.Module):
             window_size = self._window_token_size
 
         # Compute attention using the backend function
-        output = vision_attention(q, k, v, self.scale, window_size)
+        output = vision_attention(
+            q,
+            k,
+            v,
+            self.scale,
+            window_size,
+            valid_token_count=valid_token_count,
+        )
 
         # Reshape back: [B, T, N, H] -> [T, B, D]
         output = output.transpose(1, 0, 2, 3).reshape(T, B, D)
@@ -327,8 +353,15 @@ class Qwen2_5_VisionBlock(nnx.Module):
         rotary_pos_emb: jax.Array,
         cu_window_seqlens: jax.Array | None = None,
         use_fullattn: bool = True,
+        valid_token_count: jax.Array | None = None,
     ) -> jax.Array:
-        x = x + self.attn(self.norm1(x), rotary_pos_emb, cu_window_seqlens, use_fullattn)
+        x = x + self.attn(
+            self.norm1(x),
+            rotary_pos_emb,
+            cu_window_seqlens,
+            use_fullattn,
+            valid_token_count=valid_token_count,
+        )
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -561,6 +594,7 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
         rotary_pos_emb: jax.Array,
         cu_seqlens: jax.Array,
         cu_window_seqlens: jax.Array,
+        valid_patch_rows: jax.Array | None = None,
     ) -> jax.Array:
         hidden_states = self.patch_embed(x)
 
@@ -582,6 +616,7 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
                     rotary_pos_emb=rotary_pos_emb,
                     cu_window_seqlens=cu_seqlens,
                     use_fullattn=True,
+                    valid_token_count=valid_patch_rows,
                 )
             else:
                 hidden_states = blk(
@@ -589,6 +624,7 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
                     rotary_pos_emb=rotary_pos_emb,
                     cu_window_seqlens=cu_window_seqlens,
                     use_fullattn=False,
+                    valid_token_count=valid_patch_rows,
                 )
 
         # adapter

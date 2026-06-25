@@ -400,6 +400,10 @@ class ModelWorker:
             forward_batch = model_worker_batch.forward_batch
         else:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        self.model_runner.prepare_inmodel_multimodal_forward(
+            model_worker_batch=model_worker_batch,
+            forward_batch=forward_batch,
+        )
 
         if forward_metadata is None:
             forward_metadata = self.model_runner.attn_backend.get_forward_metadata(

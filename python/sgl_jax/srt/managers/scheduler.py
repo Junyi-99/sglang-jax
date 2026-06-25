@@ -51,6 +51,7 @@ from sgl_jax.srt.managers.schedule_batch import (
     FINISH_ABORT,
     Req,
     ScheduleBatch,
+    _extract_mm_value,
     acc_global_bid,
     global_server_args_dict,
 )
@@ -1044,16 +1045,18 @@ class Scheduler(
         req.disagg_transfer_id = recv_req.disagg_transfer_id or req.rid
         if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
             req.mm_inputs = recv_req.mm_inputs
-            multimodal_embedding = recv_req.mm_inputs.get("multimodal_embedding")
+            multimodal_embedding = _extract_mm_value(recv_req.mm_inputs, "multimodal_embedding")
             req.multimodal_embedding = multimodal_embedding
             if (
-                recv_req.mm_inputs.get("deepstack_visual_pos_mask") is not None
-                and recv_req.mm_inputs.get("deepstack_visual_embedding") is not None
+                _extract_mm_value(recv_req.mm_inputs, "deepstack_visual_pos_mask") is not None
+                and _extract_mm_value(recv_req.mm_inputs, "deepstack_visual_embedding") is not None
             ):
                 req.apply_for_deepstack = True
-                req.deepstack_visual_pos_mask = recv_req.mm_inputs.get("deepstack_visual_pos_mask")
-                req.deepstack_visual_embedding = recv_req.mm_inputs.get(
-                    "deepstack_visual_embedding"
+                req.deepstack_visual_pos_mask = _extract_mm_value(
+                    recv_req.mm_inputs, "deepstack_visual_pos_mask"
+                )
+                req.deepstack_visual_embedding = _extract_mm_value(
+                    recv_req.mm_inputs, "deepstack_visual_embedding"
                 )
         # Validate prompt length
         error_msg = validate_input_length(

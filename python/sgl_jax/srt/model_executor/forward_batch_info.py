@@ -365,7 +365,7 @@ class ForwardBatch:
         if batch.input_embedding is not None:
             (input_embedding,) = device_array(
                 (batch.input_embedding,),
-                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data", None))),
             )
         if input_embedding is not None:
             input_embedding = input_embedding.astype(jnp.bfloat16)
