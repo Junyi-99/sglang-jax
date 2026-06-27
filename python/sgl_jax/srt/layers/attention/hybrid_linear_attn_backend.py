@@ -259,6 +259,18 @@ def attn_backend_wrapper(
             conv_kernel_size=text_cfg.linear_conv_kernel_dim,
             mesh=runner.mesh,
         )
+    elif getattr(runner.model_config.hf_config, "mamba2_state_pool_spec", None) is not None:
+        from sgl_jax.srt.layers.attention.linear.mamba2_backend import Mamba2AttnBackend
+
+        hf_cfg = runner.model_config.hf_config
+        linear_attn_backend = Mamba2AttnBackend(
+            num_heads=hf_cfg.mamba_num_heads,
+            head_dim=hf_cfg.mamba_head_dim,
+            ssm_state_size=hf_cfg.ssm_state_size,
+            n_groups=hf_cfg.n_groups,
+            conv_kernel_size=hf_cfg.conv_kernel,
+            mesh=runner.mesh,
+        )
     elif runner.lightning_config is not None:
         from sgl_jax.srt.layers.attention.linear.lightning_backend import (
             LightningAttnBackend,
