@@ -385,6 +385,10 @@ def _kda_fwd_intra_kernel(
     k_f32 = k.astype(jnp.float32)
     beta_f32 = beta.astype(jnp.float32)
 
+    # Build Aqk and L directly using exp2(g[i] - g[j]).
+    # For causal (i >= j): g_cumsum[i] <= g_cumsum[j], so g[i]-g[j] <= 0,
+    # giving exp2 in (0, 1].  This avoids the split-normalization overflow
+    # that occurs with exp2(g-gn) when per-step gate changes exceed ~127.
     causal_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32))
     strict_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32), k=-1)
 
@@ -1197,7 +1201,7 @@ def chunk_kda_fwd(
     use_qk_l2norm_in_kernel: bool = False,
     chunk_indices: jax.Array | None = None,
     chunk_size: int = 64,
-    safe_gate: bool = True,
+    safe_gate: bool = False,
     lower_bound: float | None = None,
     use_gate_in_kernel: bool = False,
     A_log: jax.Array | None = None,
