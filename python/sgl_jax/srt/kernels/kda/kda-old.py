@@ -391,56 +391,19 @@ def _kda_fwd_intra_kernel(
     causal_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32))
     strict_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32), k=-1)
 
-    if safe_gate:
-        # Bounded-gate fast path: Aqk/L become BT/16 column-strip GEMMs
-        # [BT,K]@[K,16] on the MXU instead of a [BT,BT,K] elementwise tensor
-        # on the VPU ([16,16,128]).
-        SB = 16
-        aqk_strips, l_strips = [], []
-        for blk in range(BT // SB):
-            cols = slice(blk * SB, (blk + 1) * SB)
-            r_b = g_f32[blk * SB + SB // 2 : blk * SB + SB // 2 + 1, :]  # [1, K]
-            row = exp2(g_f32 - r_b)  # [BT, K]
-            col = k_f32[cols] * exp2(r_b - g_f32[cols])  # [SB, K]
-            aqk_strips.append(
-                jax.lax.dot_general(
-                    q_f32 * row,
-                    col,
-                    (((1,), (1,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
-            )
-            l_strips.append(
-                jax.lax.dot_general(
-                    k_f32 * row,
-                    col,
-                    (((1,), (1,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
-            )
-        o_i = jnp.arange(BT, dtype=jnp.int32)
-        # Aqk[i, j] = scale * sum_k q[i,k] * k[j,k] * exp2(g[i,k] - g[j,k])
-        Aqk = jnp.where(
-            o_i[:, None] >= o_i[None, :], scale * jnp.concatenate(aqk_strips, axis=-1), 0.0
-        )
-        # L[i, j] = sum_k k[i,k] * k[j,k] * exp2(g[i,k] - g[j,k])   (i > j)
-        L = jnp.where(o_i[:, None] > o_i[None, :], jnp.concatenate(l_strips, axis=-1), 0.0)
-    else:
-        # g_diff[i, j, k] = g[i, k] - g[j, k];  shape [BT, BT, K]
-        g_diff = g_f32[:, None, :] - g_f32[None, :, :]
-        # Mask anti-causal entries to -126 before exp2 to prevent overflow;
-        # they will be zeroed by causal_bt / strict_bt anyway.
-        g_diff = jnp.where(causal_bt[:, :, None] > 0, g_diff, -126.0)
-        decay = exp2(jnp.maximum(g_diff, -126.0))  # [BT, BT, K]
+    # g_diff[i, j, k] = g[i, k] - g[j, k];  shape [BT, BT, K]
+    g_diff = g_f32[:, None, :] - g_f32[None, :, :]
+    # Mask anti-causal entries to -126 before exp2 to prevent overflow;
+    # they will be zeroed by causal_bt / strict_bt anyway.
+    g_diff = jnp.where(causal_bt[:, :, None] > 0, g_diff, -126.0)
+    decay = exp2(jnp.maximum(g_diff, -126.0))  # [BT, BT, K]
 
-        # Aqk[i, j] = scale * sum_k q[i,k] * k[j,k] * decay[i,j,k]
-        Aqk = scale * jnp.sum(q_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1)
-
-        # L[i, j] = beta[i] * sum_k k[i,k] * k[j,k] * decay[i,j,k]   (i > j)
-        L = jnp.sum(k_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1)
-
+    # Aqk[i, j] = scale * sum_k q[i,k] * k[j,k] * decay[i,j,k]
+    Aqk = scale * jnp.sum(q_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1)
     Aqk = (Aqk * causal_bt).astype(dtype)
-    L = L * beta_f32 * strict_bt
+
+    # L[i, j] = beta[i] * sum_k k[i,k] * k[j,k] * decay[i,j,k]   (i > j)
+    L = jnp.sum(k_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1) * beta_f32 * strict_bt
 
     v_beta = v.astype(jnp.float32) * beta_f32
     k_eg_beta = k_f32 * exp2(g_f32) * beta_f32
@@ -485,7 +448,7 @@ def kda_fwd_intra(
     cu_seqlens,
     chunk_size=64,
     chunk_indices=None,
-    safe_gate=False,
+    safe_gate=True,
     disable_recompute=False,
 ):
     assert cu_seqlens is not None, "cu_seqlens must be provided for varlen"
@@ -1190,7 +1153,7 @@ def chunk_kda_fwd(
     use_qk_l2norm_in_kernel: bool = False,
     chunk_indices: jax.Array | None = None,
     chunk_size: int = 64,
-    safe_gate: bool = False,
+    safe_gate: bool = True,
     lower_bound: float | None = None,
     use_gate_in_kernel: bool = False,
     A_log: jax.Array | None = None,
@@ -1220,16 +1183,6 @@ def chunk_kda_fwd(
     assert use_qk_l2norm_in_kernel is False
     assert cp_context is None
     assert not transpose_state_layout
-
-    # Mirrors fla.ops.kda.chunk_kda
-    if safe_gate and use_gate_in_kernel:
-        if lower_bound is None:
-            raise ValueError(
-                "`lower_bound` must be specified when `safe_gate=True` and "
-                "`use_gate_in_kernel=True`."
-            )
-        if not (-5.0 <= lower_bound < 0.0):
-            raise ValueError(f"`lower_bound` must be in the safe range [-5, 0), got {lower_bound}.")
     assert not return_intermediate_states
     assert not disable_recompute
 

@@ -392,9 +392,15 @@ def _kda_fwd_intra_kernel(
     strict_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32), k=-1)
 
     if safe_gate:
-        # Bounded-gate fast path: Aqk/L become BT/16 column-strip GEMMs
+        # Bounded-gate fast path: the decay factorizes per 16-token sub-chunk —
+        # the reference cancels exactly, exp2(g_i - r_b) * exp2(r_b - g_j) ==
+        # exp2(g_i - g_j) — so Aqk/L become BT/16 column-strip GEMMs
         # [BT,K]@[K,16] on the MXU instead of a [BT,BT,K] elementwise tensor
-        # on the VPU ([16,16,128]).
+        # on the VPU.  With the gate bounded to [-5, 0) (validated at the
+        # chunk_kda_fwd entry, mirroring fla), kept-half factor exponents stay
+        # under 8*5/ln2 ≈ 57.7.  Anti-causal rows of a strip may overflow to
+        # inf/NaN; the where-masks below *select* rather than multiply, so
+        # that garbage is discarded without poisoning the kept half.
         SB = 16
         aqk_strips, l_strips = [], []
         for blk in range(BT // SB):
@@ -426,6 +432,10 @@ def _kda_fwd_intra_kernel(
         # L[i, j] = sum_k k[i,k] * k[j,k] * exp2(g[i,k] - g[j,k])   (i > j)
         L = jnp.where(o_i[:, None] > o_i[None, :], jnp.concatenate(l_strips, axis=-1), 0.0)
     else:
+        # Build Aqk and L directly using exp2(g[i] - g[j]).
+        # For causal (i >= j): g_cumsum[i] <= g_cumsum[j], so g[i]-g[j] <= 0,
+        # giving exp2 in (0, 1].  This avoids the split-normalization overflow
+        # that occurs with exp2(g-gn) when per-step gate changes exceed ~127.
         # g_diff[i, j, k] = g[i, k] - g[j, k];  shape [BT, BT, K]
         g_diff = g_f32[:, None, :] - g_f32[None, :, :]
         # Mask anti-causal entries to -126 before exp2 to prevent overflow;
