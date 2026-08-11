@@ -392,17 +392,17 @@ def _kda_fwd_intra_kernel(
     strict_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32), k=-1)
 
     if safe_gate:
-        # Bounded-gate fast path: Aqk/L become BT/16 column-strip GEMMs
+        # safe_gate path: Aqk/L become BT/16 per-sub-chunk GEMMs
         # [BT,K]@[K,16] on the MXU instead of a [BT,BT,K] elementwise tensor
         # on the VPU ([16,16,128]).
         SB = 16
-        aqk_strips, l_strips = [], []
+        aqk_subchunks, l_subchunks = [], []
         for blk in range(BT // SB):
             cols = slice(blk * SB, (blk + 1) * SB)
             r_b = g_f32[blk * SB + SB // 2 : blk * SB + SB // 2 + 1, :]  # [1, K]
             row = exp2(g_f32 - r_b)  # [BT, K]
             col = k_f32[cols] * exp2(r_b - g_f32[cols])  # [SB, K]
-            aqk_strips.append(
+            aqk_subchunks.append(
                 jax.lax.dot_general(
                     q_f32 * row,
                     col,
@@ -410,7 +410,7 @@ def _kda_fwd_intra_kernel(
                     preferred_element_type=jnp.float32,
                 )
             )
-            l_strips.append(
+            l_subchunks.append(
                 jax.lax.dot_general(
                     k_f32 * row,
                     col,
@@ -421,10 +421,10 @@ def _kda_fwd_intra_kernel(
         o_i = jnp.arange(BT, dtype=jnp.int32)
         # Aqk[i, j] = scale * sum_k q[i,k] * k[j,k] * exp2(g[i,k] - g[j,k])
         Aqk = jnp.where(
-            o_i[:, None] >= o_i[None, :], scale * jnp.concatenate(aqk_strips, axis=-1), 0.0
+            o_i[:, None] >= o_i[None, :], scale * jnp.concatenate(aqk_subchunks, axis=-1), 0.0
         )
         # L[i, j] = sum_k k[i,k] * k[j,k] * exp2(g[i,k] - g[j,k])   (i > j)
-        L = jnp.where(o_i[:, None] > o_i[None, :], jnp.concatenate(l_strips, axis=-1), 0.0)
+        L = jnp.where(o_i[:, None] > o_i[None, :], jnp.concatenate(l_subchunks, axis=-1), 0.0)
     else:
         # g_diff[i, j, k] = g[i, k] - g[j, k];  shape [BT, BT, K]
         g_diff = g_f32[:, None, :] - g_f32[None, :, :]
