@@ -240,20 +240,37 @@ def _build_hybrid_pools(
         state_size % dp_size == 0
     ), f"recurrent state_size ({state_size}) must be divisible by dp_size ({dp_size})."
 
-    state_params = _linear_state_params_from_config(cfg)
-    rsp = RecurrentStatePool(
-        linear_recurrent_layer_ids=state_params.layers,
-        size=state_size,
-        num_heads=state_params.num_heads,
-        head_dim=state_params.head_dim,
-        conv_kernel_size=state_params.conv_kernel_size,
-        mesh=mesh,
-        dp_size=dp_size,
-        temporal_dtype=state_params.dtype.temporal,
-        conv_dtype=state_params.dtype.conv,
-        num_k_heads=state_params.num_k_heads,
-        head_k_dim=state_params.head_k_dim,
-    )
+    # Nemotron-H: non-square Mamba2 SSM state -> dedicated pool.
+    pool_spec = getattr(cfg, "mamba2_state_pool_spec", None)
+    if pool_spec is not None:
+        from sgl_jax.srt.mem_cache.mamba2_state_pool import Mamba2StatePool
+
+        rsp = Mamba2StatePool(
+            linear_recurrent_layer_ids=pool_spec.layers,
+            size=state_size,
+            num_heads=pool_spec.num_heads,
+            head_dim=pool_spec.head_dim,
+            ssm_state_size=pool_spec.ssm_state_size,
+            conv_dim=pool_spec.conv_dim,
+            conv_kernel_size=pool_spec.conv_kernel_size,
+            mesh=mesh,
+            dp_size=dp_size,
+        )
+    else:
+        state_params = _linear_state_params_from_config(cfg)
+        rsp = RecurrentStatePool(
+            linear_recurrent_layer_ids=state_params.layers,
+            size=state_size,
+            num_heads=state_params.num_heads,
+            head_dim=state_params.head_dim,
+            conv_kernel_size=state_params.conv_kernel_size,
+            mesh=mesh,
+            dp_size=dp_size,
+            temporal_dtype=state_params.dtype.temporal,
+            conv_dtype=state_params.dtype.conv,
+            num_k_heads=state_params.num_k_heads,
+            head_k_dim=state_params.head_k_dim,
+        )
     hybrid_pool = HybridReqToTokenPool(
         size=max_num_reqs,
         max_context_len=max_context_len,
@@ -854,7 +871,15 @@ class ModelRunnerKVCacheMixin:
             return self.kimi_linear_config
         if self.qwen3_5_hybrid_config is not None:
             return self.qwen3_5_hybrid_config.text_config
+        if self.nemotron_h_config is not None:
+            return self.nemotron_h_config
         return self.lightning_config
+
+    @property
+    def nemotron_h_config(self: ModelRunner):
+        from sgl_jax.srt.configs.nemotron_h_hybrid import get_nemotron_h_config
+
+        return get_nemotron_h_config(self.model_config.hf_config)
 
     def _kv_pool_layer_count(self: ModelRunner):
         """Layer count for KV pool sizing.
