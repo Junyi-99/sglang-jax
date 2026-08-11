@@ -369,6 +369,7 @@ def _kda_fwd_intra_kernel(
     scale,
     disable_recompute,
     safe_gate,
+    safe_gate_cap=0.0,
 ):
     dtype = q_ref.dtype
     q = q_ref[0, 0, 0]
@@ -384,26 +385,66 @@ def _kda_fwd_intra_kernel(
     k_f32 = k.astype(jnp.float32)
     beta_f32 = beta.astype(jnp.float32)
 
-    # Build Aqk and L directly using exp2(g[i] - g[j]).
-    # For causal (i >= j): g_cumsum[i] <= g_cumsum[j], so g[i]-g[j] <= 0,
-    # giving exp2 in (0, 1].  This avoids the split-normalization overflow
-    # that occurs with exp2(g-gn) when per-step gate changes exceed ~127.
     causal_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32))
     strict_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32), k=-1)
 
-    # g_diff[i, j, k] = g[i, k] - g[j, k];  shape [BT, BT, K]
-    g_diff = g_f32[:, None, :] - g_f32[None, :, :]
-    # Mask anti-causal entries to -126 before exp2 to prevent overflow;
-    # they will be zeroed by causal_bt / strict_bt anyway.
-    g_diff = jnp.where(causal_bt[:, :, None] > 0, g_diff, -126.0)
-    decay = exp2(jnp.maximum(g_diff, -126.0))  # [BT, BT, K]
+    if safe_gate:
+        # Bounded-gate fast path (safe_gate + lower_bound): the decay
+        # factorizes per 16-token sub-chunk — the reference cancels exactly,
+        # exp2(g_i - r_b) * exp2(r_b - g_j) == exp2(g_i - g_j) — so Aqk/L
+        # become BT/16 column-strip GEMMs [BT,K]@[K,16] on the MXU instead of
+        # a [BT,BT,K] elementwise tensor on the VPU.  Kept-half factor
+        # exponents are bounded by safe_gate_cap = 8*|lower_bound|/ln2 (57.7
+        # for lower_bound=-5); the clamp only touches anti-causal rows, and
+        # keeps them finite so the multiplicative causal mask below stays
+        # NaN-free (the caller guarantees 2*cap + log2(K) < 126).
+        SB = 16
+        aqk_strips, l_strips = [], []
+        for blk in range(BT // SB):
+            cols = slice(blk * SB, (blk + 1) * SB)
+            r_b = g_f32[blk * SB + SB // 2 : blk * SB + SB // 2 + 1, :]  # [1, K]
+            row = exp2(jnp.minimum(g_f32 - r_b, safe_gate_cap))  # [BT, K]
+            col = k_f32[cols] * exp2(r_b - g_f32[cols])  # [SB, K]
+            aqk_strips.append(
+                jax.lax.dot_general(
+                    q_f32 * row,
+                    col,
+                    (((1,), (1,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+            )
+            l_strips.append(
+                jax.lax.dot_general(
+                    k_f32 * row,
+                    col,
+                    (((1,), (1,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+            )
+        # Aqk[i, j] = scale * sum_k q[i,k] * k[j,k] * exp2(g[i,k] - g[j,k])
+        Aqk = scale * jnp.concatenate(aqk_strips, axis=-1)
+        # L[i, j] = sum_k k[i,k] * k[j,k] * exp2(g[i,k] - g[j,k])
+        L = jnp.concatenate(l_strips, axis=-1)
+    else:
+        # Build Aqk and L directly using exp2(g[i] - g[j]).
+        # For causal (i >= j): g_cumsum[i] <= g_cumsum[j], so g[i]-g[j] <= 0,
+        # giving exp2 in (0, 1].  This avoids the split-normalization overflow
+        # that occurs with exp2(g-gn) when per-step gate changes exceed ~127.
+        # g_diff[i, j, k] = g[i, k] - g[j, k];  shape [BT, BT, K]
+        g_diff = g_f32[:, None, :] - g_f32[None, :, :]
+        # Mask anti-causal entries to -126 before exp2 to prevent overflow;
+        # they will be zeroed by causal_bt / strict_bt anyway.
+        g_diff = jnp.where(causal_bt[:, :, None] > 0, g_diff, -126.0)
+        decay = exp2(jnp.maximum(g_diff, -126.0))  # [BT, BT, K]
 
-    # Aqk[i, j] = scale * sum_k q[i,k] * k[j,k] * decay[i,j,k]
-    Aqk = scale * jnp.sum(q_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1)
+        # Aqk[i, j] = scale * sum_k q[i,k] * k[j,k] * decay[i,j,k]
+        Aqk = scale * jnp.sum(q_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1)
+
+        # L[i, j] = beta[i] * sum_k k[i,k] * k[j,k] * decay[i,j,k]   (i > j)
+        L = jnp.sum(k_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1)
+
     Aqk = (Aqk * causal_bt).astype(dtype)
-
-    # L[i, j] = beta[i] * sum_k k[i,k] * k[j,k] * decay[i,j,k]   (i > j)
-    L = jnp.sum(k_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1) * beta_f32 * strict_bt
+    L = L * beta_f32 * strict_bt
 
     v_beta = v.astype(jnp.float32) * beta_f32
     k_eg_beta = k_f32 * exp2(g_f32) * beta_f32
@@ -435,6 +476,7 @@ def _kda_fwd_intra_kernel(
         "chunk_size",
         "scale",
         "safe_gate",
+        "safe_gate_cap",
         "disable_recompute",
     ],
 )
@@ -448,7 +490,8 @@ def kda_fwd_intra(
     cu_seqlens,
     chunk_size=64,
     chunk_indices=None,
-    safe_gate=True,
+    safe_gate=False,
+    safe_gate_cap=0.0,
     disable_recompute=False,
 ):
     assert cu_seqlens is not None, "cu_seqlens must be provided for varlen"
@@ -529,6 +572,7 @@ def kda_fwd_intra(
             scale=scale,
             disable_recompute=disable_recompute,
             safe_gate=safe_gate,
+            safe_gate_cap=safe_gate_cap,
         ),
         interpret=get_interpret(),
         out_shape=[
@@ -1247,7 +1291,17 @@ def chunk_kda_fwd(
             chunk_indices=chunk_indices,
         )
 
-    # Step 2: Intra-chunk solve
+    # Step 2: Intra-chunk solve.
+    # The strip-GEMM fast path in the intra kernel is only numerically valid
+    # for a bounded gate: with lower_bound set, per-token |g| (log2-space) is
+    # at most |lower_bound|/ln2, so factor exponents within a 16-token
+    # sub-chunk stay under cap = 8*|lower_bound|/ln2 and the clamped
+    # anti-causal entries stay finite through the dot (2*cap + log2(K) < 126).
+    safe_cap = 0.0
+    use_safe_intra = bool(safe_gate) and lower_bound is not None
+    if use_safe_intra:
+        safe_cap = 8.0 * abs(float(lower_bound)) * _RCP_LN2
+        use_safe_intra = 2.0 * safe_cap + math.log2(q.shape[-1]) < 126.0
     w, u, qg, kg, Aqk, Akk = kda_fwd_intra(
         q=q,
         k=k,
@@ -1255,7 +1309,8 @@ def chunk_kda_fwd(
         gk=g_cumsum,
         beta=beta,
         scale=scale,
-        safe_gate=safe_gate,
+        safe_gate=use_safe_intra,
+        safe_gate_cap=safe_cap,
         chunk_size=BT,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
