@@ -1922,21 +1922,101 @@ def _kda_fwd_intra_kernel_hb(
     LOWER_BOUND,
     NUM_HEADS,
 ):
-    for h in range(NUM_HEADS):
-        a_vec = a_ref[h] if APPLY_GATE else None
-        bias_vec = bias_ref[h] if APPLY_GATE else None
-        u, w, kg, Aqk, _, g_cum = _intra_head_math(
-            q_ref[0, :, h, :], k_ref[0, :, h, :], g_ref[0, :, h, :],
-            beta_ref[0, :, h, :], v_ref[0, :, h, :], a_vec, bias_vec,
-            chunk_size=chunk_size, head_dim=head_dim, value_dim=value_dim,
-            scale=scale, safe_gate=safe_gate, APPLY_GATE=APPLY_GATE,
-            LOWER_BOUND=LOWER_BOUND, PRE_CUMSUM=False, WANT_AINV=False,
-        )
-        u_out_ref[0, :, h, :] = u.astype(u_out_ref.dtype)
-        w_out_ref[0, :, h, :] = w.astype(w_out_ref.dtype)
-        kg_out_ref[0, :, h, :] = kg.astype(kg_out_ref.dtype)
-        Aqk_out_ref[0, :, h, :] = Aqk.astype(Aqk_out_ref.dtype)
-        g_cum_out_ref[0, :, h, :] = g_cum.astype(g_cum_out_ref.dtype)
+    if not safe_gate:
+        # 调试路径（elementwise decay + 逐行消元）：逐 head 串行，保持与
+        # _intra_head_math 单一来源。
+        for h in range(NUM_HEADS):
+            a_vec = a_ref[h] if APPLY_GATE else None
+            bias_vec = bias_ref[h] if APPLY_GATE else None
+            u, w, kg, Aqk, _, g_cum = _intra_head_math(
+                q_ref[0, :, h, :], k_ref[0, :, h, :], g_ref[0, :, h, :],
+                beta_ref[0, :, h, :], v_ref[0, :, h, :], a_vec, bias_vec,
+                chunk_size=chunk_size, head_dim=head_dim, value_dim=value_dim,
+                scale=scale, safe_gate=safe_gate, APPLY_GATE=APPLY_GATE,
+                LOWER_BOUND=LOWER_BOUND, PRE_CUMSUM=False, WANT_AINV=False,
+            )
+            u_out_ref[0, :, h, :] = u.astype(u_out_ref.dtype)
+            w_out_ref[0, :, h, :] = w.astype(w_out_ref.dtype)
+            kg_out_ref[0, :, h, :] = kg.astype(kg_out_ref.dtype)
+            Aqk_out_ref[0, :, h, :] = Aqk.astype(Aqk_out_ref.dtype)
+            g_cum_out_ref[0, :, h, :] = g_cum.astype(g_cum_out_ref.dtype)
+        return
+
+    # ---- safe_gate 快路径：elementwise 跨 H 向量化 + MXU stage 交错 ----
+    # 每 head 的算子链相互独立；按 stage-major 发射（同一 stage 内先遍历 h），
+    # 相邻 MXU 指令无依赖，fill/drain 可流水。elementwise 一次算全 H，指令数 ÷H。
+    BT = chunk_size
+    H = NUM_HEADS
+    dtype = q_ref.dtype
+
+    # stage 1: gate 激活 + 前缀和（全 H 向量化）
+    g_all = g_ref[0].astype(jnp.float32)  # [BT, H, K]
+    if APPLY_GATE:
+        a_all = a_ref[...].astype(jnp.float32)      # [H, K]
+        b_all = bias_ref[...].astype(jnp.float32)
+        g_all = LOWER_BOUND * jax.nn.sigmoid(a_all[None] * (g_all + b_all[None]))
+    num_steps = int(math.log2(BT))
+    assert (1 << num_steps) == BT
+    for d in range(num_steps):
+        s = 1 << d
+        g_all = jnp.concatenate([g_all[:s], g_all[s:] + g_all[:-s]], axis=0)
+    g_all = g_all * _RCP_LN2
+    g_cum_out_ref[0] = g_all.astype(g_cum_out_ref.dtype)
+
+    q_all = q_ref[0].astype(jnp.float32)
+    k_all = k_ref[0].astype(jnp.float32)
+    v_all = v_ref[0].astype(jnp.float32)
+    beta_all = beta_ref[0].astype(jnp.float32)  # [BT, H, 1]
+
+    # strips：row/col 向量化构造，GEMM 按 (blk, h) 交错
+    SB = 16
+    o_i = jnp.arange(BT, dtype=jnp.int32)
+    causal = o_i[:, None] >= o_i[None, :]
+    strict = o_i[:, None] > o_i[None, :]
+    dn = (((1,), (1,)), ((), ()))
+    aqk_parts = [[] for _ in range(H)]
+    l_parts = [[] for _ in range(H)]
+    for blk in range(BT // SB):
+        cols = slice(blk * SB, (blk + 1) * SB)
+        r_b = g_all[blk * SB + SB // 2 : blk * SB + SB // 2 + 1]  # [1, H, K]
+        row_all = exp2(g_all - r_b)                                # [BT, H, K]
+        col_all = k_all[cols] * exp2(r_b - g_all[cols])            # [SB, H, K]
+        qrow = q_all * row_all
+        krow = k_all * row_all
+        for h in range(H):
+            aqk_parts[h].append(
+                jax.lax.dot_general(qrow[:, h], col_all[:, h], dn,
+                                    preferred_element_type=jnp.float32)
+            )
+            l_parts[h].append(
+                jax.lax.dot_general(krow[:, h], col_all[:, h], dn,
+                                    preferred_element_type=jnp.float32)
+            )
+
+    v_beta = v_all * beta_all                       # [BT, H, V]
+    k_eg_beta = k_all * exp2(g_all) * beta_all      # [BT, H, K]
+
+    Aqks, Ls, zs = [], [], []
+    for h in range(H):
+        Aqks.append(jnp.where(causal, scale * jnp.concatenate(aqk_parts[h], -1), 0.0))
+        Ls.append(jnp.where(strict, jnp.concatenate(l_parts[h], -1), 0.0) * beta_all[:, h])
+        zs.append(jnp.concatenate([v_beta[:, h], k_eg_beta[:, h]], axis=-1))
+
+    # fused-wide Neumann（因子链），跨 H stage 交错
+    zs = [z - jax.lax.dot(L, z, preferred_element_type=jnp.float32) for L, z in zip(Ls, zs)]
+    Lp = list(Ls)
+    for _ in range(int(math.log2(BT)) - 1):
+        Lp = [jax.lax.dot(P, P, preferred_element_type=jnp.float32) for P in Lp]
+        zs = [z + jax.lax.dot(P, z, preferred_element_type=jnp.float32) for P, z in zip(Lp, zs)]
+
+    # 输出组装（向量化写回）
+    u_all = jnp.stack([z[:, :value_dim] for z in zs], axis=1)
+    w_all = jnp.stack([z[:, value_dim:] for z in zs], axis=1)
+    kg_all = k_all * exp2(g_all[BT - 1 : BT] - g_all)
+    u_out_ref[0] = u_all.astype(u_out_ref.dtype)
+    w_out_ref[0] = w_all.astype(w_out_ref.dtype)
+    kg_out_ref[0] = kg_all.astype(kg_out_ref.dtype)
+    Aqk_out_ref[0] = jnp.stack(Aqks, axis=1).astype(Aqk_out_ref.dtype)
 
 
 def kda_fwd_intra_hb(
@@ -2018,15 +2098,45 @@ def _chunk_kda_fused_h_o_kernel_hb(
         if USE_INITIAL_STATE:
             scratch_ref[...] = h0_ref[0].astype(jnp.float32)
 
-    # H 条递推链相互独立：Python 展开后调度器可交错，填充依赖 bubble
-    for h in range(NUM_HEADS):
-        b_o, S_new = _fused_step_math(
-            q_ref[0, :, h, :], k_ref[0, :, h, :], v_ref[0, :, h, :],
-            w_ref[0, :, h, :], g_ref[0, :, h, :], A_ref[0, :, h, :],
-            scratch_ref[h], scale,
-        )
-        o_ref[0, :, h, :] = b_o.astype(o_ref.dtype)
-        scratch_ref[h] = S_new
+    # elementwise 跨 H 向量化 + MXU 按 stage 交错（A: 残差，B/C: o，D: 状态）
+    q_all = q_ref[0].astype(jnp.float32)   # [BT, H, K]
+    k_all = k_ref[0].astype(jnp.float32)
+    v_all = v_ref[0].astype(jnp.float32)   # [BT, H, V]
+    w_all = w_ref[0].astype(jnp.float32)
+    g_all = g_ref[0].astype(jnp.float32)
+    A_all = A_ref[0].astype(jnp.float32)   # [BT, H, BT]
+    S_all = scratch_ref[...]               # [H, K, V]
+
+    BT = q_ref.shape[1]
+    g0 = g_all[0:1]                                        # [1, H, K]
+    qg_all = q_all * exp2(jnp.maximum(g_all - g0, -126.0))
+    h_scale = exp2(jnp.maximum(g0[0], -126.0))             # [H, K]
+    g_last = g_all[BT - 1]                                 # [H, K]
+    m_s = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
+    A_mask = jnp.where(m_s[:, None, :], A_all, 0.0)        # [BT, H, BT]
+
+    HI = jax.lax.Precision.HIGHEST
+    bv = [
+        v_all[:, h] - jnp.dot(w_all[:, h], S_all[h], precision=HI,
+                              preferred_element_type=jnp.float32)
+        for h in range(NUM_HEADS)
+    ]
+    o1 = [
+        scale * jnp.dot(qg_all[:, h], S_all[h] * h_scale[h][:, None], precision=HI,
+                        preferred_element_type=jnp.float32)
+        for h in range(NUM_HEADS)
+    ]
+    o2 = [
+        jnp.dot(A_mask[:, h], bv[h], precision=HI, preferred_element_type=jnp.float32)
+        for h in range(NUM_HEADS)
+    ]
+    o_ref[0] = jnp.stack([a + b for a, b in zip(o1, o2)], axis=1).astype(o_ref.dtype)
+
+    upd = [
+        jnp.dot(k_all[:, h].T, bv[h], precision=HI, preferred_element_type=jnp.float32)
+        for h in range(NUM_HEADS)
+    ]
+    scratch_ref[...] = S_all * exp2(g_last)[:, :, None] + jnp.stack(upd, axis=0)
 
     @pl.when(end_flag_ref[idx_c] == 1)
     def _():
