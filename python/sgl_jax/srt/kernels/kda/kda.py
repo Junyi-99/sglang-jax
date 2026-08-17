@@ -349,56 +349,65 @@ def _solve_unit_lower_triangular(A, b):
 
     return jnp.concatenate(blocks, axis=0)
 
-
-def _neumann_fused_wide(L, z, BT):
-    # K3-branch solve: L is strictly lower triangular => nilpotent (L^BT = 0),
-    # so (I+L)^-1 equals the finite factorization (I-L)(I+L^2)...(I+L^{BT/2})
-    # exactly. Propagate Z = [I | v_beta | k_eg_beta] through the factors
-    # (they are polynomials in L and commute): log2(BT)-1 power dots plus
-    # log2(BT) wide [BT,BT]@[BT,BT+V+K] dots that fill the MXU lane width.
-    # Runs in one bf16 MXU pass: applying factors to the RHS never
-    # materializes the explicit inverse, whose compounding rounding error is
-    # what makes the DIRECT bf16 form fail the 5e-4 oracle gate (measured:
-    # direct 6.9e-04 FAIL, fused 2.77e-04 OK). Do not "simplify" this into
-    # inverse-then-multiply.
-    z = z - jax.lax.dot(L, z, preferred_element_type=jnp.float32)
-    Lp = L
-    for _ in range(int(math.log2(BT)) - 1):
-        Lp = jax.lax.dot(Lp, Lp, preferred_element_type=jnp.float32)
-        z = z + jax.lax.dot(Lp, z, preferred_element_type=jnp.float32)
-    return z
-
-
+# 统一寻址版：数组是 [1, H, T_alloc, D]，grid=(H, NC)，块 c 恒等映射到行 [c*BT,(c+1)*BT)。
+# kernel 里的 ref 是 BlockSpec 切好的一块 [1, 1, BT, D]。
 def _kda_fwd_intra_kernel(
-    q_ref,
-    k_ref,
-    g_ref,
-    beta_ref,
-    v_ref,
-    u_out_ref,
-    w_out_ref,
-    qg_out_ref,
-    kg_out_ref,
-    Aqk_out_ref,
-    Akk_inv_out_ref,
+    q_ref, # [1, 1, BT, K] = [1, 1, 64, 128]
+    k_ref, # [1, 1, BT, K]
+    g_ref, # [1, 1, BT, K]
+    beta_ref, # [1, 1, BT, 1]
+    v_ref, # [1, 1, BT, V]
+    a_ref,    # [1, 1, 1, K] exp(A_log) 按 head 广播；APPLY_GATE=False 时为 None
+    bias_ref, # [1, 1, 1, K] dt_bias；APPLY_GATE=False 时为 None
+    u_out_ref, # [1, 1, BT, V]
+    w_out_ref, # [1, 1, 1, BT, K]
+    qg_out_ref,# [1, 1, 1, BT, V]
+    kg_out_ref,#
+    Aqk_out_ref,#
+    Akk_inv_out_ref,#
+    g_cum_out_ref,  # [1, 1, 1, BT, K] f32：融合进来的 stage 1 输出，给 stage 3+4 用
     *,
-    chunk_size,
-    head_dim,
-    value_dim,
+    chunk_size, # 64
+    head_dim, # K=128
+    value_dim,# V=128
     scale,
     disable_recompute,
     safe_gate,
+    APPLY_GATE,   # 融合的 stage 1：是否在 kernel 内做 gate 激活
+    LOWER_BOUND,  # None -> -exp(A)*softplus；float -> lb*sigmoid
+    NEUMANN_INV,  # True: Neumann 倍增求逆(PR#3)；False: 逐行前向消元(旧)
 ):
+    # q_r, k_r, g_r, v_r:
+    # beta_r: [B, H, N, D, 1]
     dtype = q_ref.dtype
-    q = q_ref[0, 0, 0]
-    k = k_ref[0, 0, 0]
-    g = g_ref[0, 0, 0]
-    beta = beta_ref[0, 0, 0]
-    v = v_ref[0, 0, 0]
+    q = q_ref[0, 0] # [1,1,64,128] --> [64, 128] # 索引掉前两个 1 维
+    k = k_ref[0, 0] # [64, 128]
+    g = g_ref[0, 0] # [64, 128] raw gate（APPLY_GATE 时）或已激活的 log 衰减；均为"逐步值"，cumsum 在下面做
+    beta = beta_ref[0, 0]  # [64, 1]
+    v = v_ref[0, 0]  # [64, 128]
 
-    BT = chunk_size
+    BT = chunk_size # 64
 
+    # ---- Fused stage 1: gate activation + chunk-local cumsum (log2 domain) ----
     g_f32 = g.astype(jnp.float32)
+    if APPLY_GATE:
+        b_a = a_ref[0, 0, 0].astype(jnp.float32)        # [K] exp(A_log[h])，逐通道广播
+        b_bias = bias_ref[0, 0, 0].astype(jnp.float32)  # [K] dt_bias[h]
+        if LOWER_BOUND is None:
+            g_f32 = -b_a * jax.nn.softplus(g_f32 + b_bias)
+        else:
+            g_f32 = LOWER_BOUND * jax.nn.sigmoid(b_a * (g_f32 + b_bias))
+    # Chunk 内前缀和：Hillis-Steele 倍增扫描（log2(BT) 步 shift+add）。
+    # 不能用 jnp.cumsum —— Pallas TPU lowering 没有实现 cumsum 原语。
+    num_steps = int(math.log2(BT))
+    assert (1 << num_steps) == BT, "chunk_size must be a power of 2 for the in-kernel scan"
+    for d in range(num_steps):
+        stride = 1 << d
+        top = g_f32[:stride, :]
+        bot = g_f32[stride:, :] + g_f32[:-stride, :]
+        g_f32 = jnp.concatenate([top, bot], axis=0)
+    g_f32 = g_f32 * _RCP_LN2  # [64, 128] 转 log2 域
+    g_cum_out_ref[0, 0] = g_f32.astype(g_cum_out_ref.dtype)
     q_f32 = q.astype(jnp.float32)
     k_f32 = k.astype(jnp.float32)
     beta_f32 = beta.astype(jnp.float32)
@@ -407,36 +416,51 @@ def _kda_fwd_intra_kernel(
     # For causal (i >= j): g_cumsum[i] <= g_cumsum[j], so g[i]-g[j] <= 0,
     # giving exp2 in (0, 1].  This avoids the split-normalization overflow
     # that occurs with exp2(g-gn) when per-step gate changes exceed ~127.
-    causal_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32))
-    strict_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32), k=-1)
+    causal_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32)) # [64, 64], i>=j 处为 1（含对角线）给 Aqk 用
+    strict_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32), k=-1) # [64,64] i>j 处为 1 （不含对角线）给 L 用
 
     if safe_gate:
         # safe_gate path: Aqk/L become BT/16 per-sub-chunk GEMMs
         # [BT,K]@[K,16] on the MXU instead of a [BT,BT,K] elementwise tensor
         # on the VPU ([16,16,128]).
         SB = 16
-        aqk_subchunks, l_subchunks = [], []
+        aqk_subchunks, l_subchunks = [], [] # 各攒 4 个 [64, 16]
         for blk in range(BT // SB):
             cols = slice(blk * SB, (blk + 1) * SB)
-            r_b = g_f32[blk * SB + SB // 2 : blk * SB + SB // 2 + 1, :]  # [1, K]
-            row = exp2(g_f32 - r_b)  # [BT, K]
+            r_b = g_f32[blk * SB + SB // 2 : blk * SB + SB // 2 + 1, :]  # [1, K] = [1, 128]
+            row = exp2(g_f32 - r_b)  # [64,128] - [1,128] 广播成 [BT, K] = [64, 128]
             col = k_f32[cols] * exp2(r_b - g_f32[cols])  # [SB, K]
+            #     [16,128]    * exp2([1,128] − [16,128] → [16,128]) → [16, 128]
+            #     列因子：k[j]·2^(r−g[j])，只算本子块 16 列
+
             aqk_subchunks.append(
                 jax.lax.dot_general(
-                    q_f32 * row,
-                    col,
-                    (((1,), (1,)), ((), ())),
+                    q_f32 * row, # [BT=64, K=128] * [BT=64, K=128]
+                    col,         # [BT=64, K=128]
+                    (
+                        ((1,), (1,)),  # 收缩维：哪两个维度做内积后消失；左操作数的第 1 维（K=128）和右操作数的第 1 维（K=128）配对做内积，这两个维度在输出里消失
+                        ((), ())       #  batch 维：两边一一配对、原样保留；空，没有 batch 维。
+                    ), 
                     preferred_element_type=jnp.float32,
                 )
             )
+            #   lhs = q_f32*row: [64, 128]（逐元素）
+            #   dot_general 收缩双方的 dim 1（K 维）：[64,128] × [16,128] → [64, 16]
+            #   这是真正的 MXU GEMM：Aqk_block[i, j_local] = Σ_c (q·2^{gᵢ−r})·(k·2^{r−gⱼ})
+
             l_subchunks.append(
                 jax.lax.dot_general(
-                    k_f32 * row,
-                    col,
-                    (((1,), (1,)), ((), ())),
+                    k_f32 * row, # [64,128] * [64,128]
+                    col, # [64,128]
+                    (
+                        ((1,), (1,)), 
+                        ((), ())
+                    ),
                     preferred_element_type=jnp.float32,
                 )
             )
+            #   同上，lhs 换成 k_f32*row: [64,128] → 输出 [64, 16]
+            
         o_i = jnp.arange(BT, dtype=jnp.int32)
         # Aqk[i, j] = scale * sum_k q[i,k] * k[j,k] * exp2(g[i,k] - g[j,k])
         Aqk = jnp.where(
@@ -447,10 +471,16 @@ def _kda_fwd_intra_kernel(
     else:
         # g_diff[i, j, k] = g[i, k] - g[j, k];  shape [BT, BT, K]
         g_diff = g_f32[:, None, :] - g_f32[None, :, :]
+        #            [64,1,128]    -   [1, 64, 128] --> [64, 64, 128]
+
         # Mask anti-causal entries to -126 before exp2 to prevent overflow;
         # they will be zeroed by causal_bt / strict_bt anyway.
         g_diff = jnp.where(causal_bt[:, :, None] > 0, g_diff, -126.0)
-        decay = exp2(jnp.maximum(g_diff, -126.0))  # [BT, BT, K]
+        #             [64, 64, 1] 广播成 [64,64,128] → [64, 64, 128]
+        #             反因果区 (i<j) 的 g_diff 是正数，先填成 -126 防止下一行 exp2 上溢
+
+
+        decay = exp2(jnp.maximum(g_diff, -126.0))  # [BT, BT, K], 位置 j 写进状态的信息，传到位置 i 时每个通道还剩多少
 
         # Aqk[i, j] = scale * sum_k q[i,k] * k[j,k] * decay[i,j,k]
         Aqk = scale * jnp.sum(q_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1)
@@ -463,18 +493,36 @@ def _kda_fwd_intra_kernel(
 
     v_beta = v.astype(jnp.float32) * beta_f32
     k_eg_beta = k_f32 * exp2(g_f32) * beta_f32
-    identity = jnp.eye(BT, dtype=jnp.float32)
 
-    if safe_gate:
-        # Kimi-K3 special branch (bounded gate, lower_bound validated in
-        # [-5, 0)): fused-wide finite Neumann, one bf16 MXU pass.
-        z = jnp.concatenate([identity, v_beta, k_eg_beta], axis=-1)
-        z = _neumann_fused_wide(L, z, BT)
-        A_inv = z[:, :BT]
-        u = z[:, BT : BT + value_dim]
-        w = z[:, BT + value_dim :]
+    if NEUMANN_INV:
+        # PR#3 移植：(I+L)^{-1} 用 Neumann 倍增求逆，替代逐行前向消元。
+        # L 严格下三角 => 幂零（L^BT = 0），级数有限步精确；log2(BT) 轮倍增全是
+        # [BT,BT] matmul，走 MXU。构造 dots 用 bf16 单 pass（免 fp32-highest 的
+        # ~6 pass 税，opt-20260803 实测 err_ratio ~1e-05），应用 dot 保持 HIGHEST。
+        M = (-L).astype(jnp.bfloat16)
+        inv = jnp.eye(BT, dtype=jnp.float32) + M.astype(jnp.float32)  # 覆盖 L^k, k<2
+        P = jax.lax.dot(M, M, preferred_element_type=jnp.float32)     # M^2
+        steps = int(math.log2(BT)) - 1
+        for i in range(steps):
+            inv = inv + jax.lax.dot(
+                inv.astype(jnp.bfloat16), P.astype(jnp.bfloat16),
+                preferred_element_type=jnp.float32,
+            )  # 覆盖 k < 2^(i+2)
+            if i < steps - 1:
+                P = jax.lax.dot(
+                    P.astype(jnp.bfloat16), P.astype(jnp.bfloat16),
+                    preferred_element_type=jnp.float32,
+                )
+        combined_b = jnp.concatenate([v_beta, k_eg_beta], axis=-1)  # [BT, V+K]
+        combined_x = jnp.dot(
+            inv, combined_b,
+            precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
+        )
+        u = combined_x[:, :value_dim]
+        w = combined_x[:, value_dim:]
+        A_inv = inv  # 逆本身就是 Akk_inv，identity 右端项省掉了
     else:
-        # General KDA: sequential forward substitution (upstream original).
+        identity = jnp.eye(BT, dtype=jnp.float32)
         combined_b = jnp.concatenate([v_beta, k_eg_beta, identity], axis=-1)
         combined_x = _solve_unit_lower_triangular(L, combined_b)
 
@@ -485,14 +533,16 @@ def _kda_fwd_intra_kernel(
     g_last = g_f32[BT - 1 : BT, :]
     kg = k_f32 * exp2(g_last - g_f32)
 
-    qg = q_f32 * exp2(g_f32) if disable_recompute else jnp.zeros_like(q_f32)
-
-    u_out_ref[0, 0, 0] = u.astype(u_out_ref.dtype)
-    w_out_ref[0, 0, 0] = w.astype(w_out_ref.dtype)
-    qg_out_ref[0, 0, 0] = qg.astype(qg_out_ref.dtype)
-    kg_out_ref[0, 0, 0] = kg.astype(kg_out_ref.dtype)
-    Aqk_out_ref[0, 0, 0] = Aqk.astype(Aqk_out_ref.dtype)
-    Akk_inv_out_ref[0, 0, 0] = A_inv.astype(Akk_inv_out_ref.dtype)
+    u_out_ref[0, 0] = u.astype(u_out_ref.dtype)
+    w_out_ref[0, 0] = w.astype(w_out_ref.dtype)
+    if disable_recompute:
+        # qg only exists to let backward skip recomputation; otherwise the
+        # output slot is None and nothing is written (saves a full HBM store).
+        qg = q_f32 * exp2(g_f32)
+        qg_out_ref[0, 0] = qg.astype(qg_out_ref.dtype)
+    kg_out_ref[0, 0] = kg.astype(kg_out_ref.dtype)
+    Aqk_out_ref[0, 0] = Aqk.astype(Aqk_out_ref.dtype)
+    Akk_inv_out_ref[0, 0] = A_inv.astype(Akk_inv_out_ref.dtype)
 
 
 @functools.partial(
@@ -502,91 +552,61 @@ def _kda_fwd_intra_kernel(
         "scale",
         "safe_gate",
         "disable_recompute",
+        "use_gate_in_kernel",
+        "lower_bound",
+        "neumann_inv",
     ],
 )
 def kda_fwd_intra(
-    q,
-    k,
-    v,
-    gk,
-    beta,
+    q,     # [1, H, T, K]  统一布局（转置后；T 已按 BT 对齐）
+    k,     # [1, H, T, K]
+    v,     # [1, H, T, V]
+    gk,    # [1, H, T, K]  raw gate（use_gate_in_kernel）或已激活逐步 log 衰减
+    beta,  # [1, H, T, 1]
     scale,
-    cu_seqlens,
     chunk_size=64,
-    chunk_indices=None,
     safe_gate=False,
     disable_recompute=False,
+    use_gate_in_kernel=False,
+    A_log=None,
+    dt_bias=None,
+    lower_bound=None,
+    neumann_inv=True,
 ):
-    assert cu_seqlens is not None, "cu_seqlens must be provided for varlen"
-    B, T, H, K = q.shape
+    """统一寻址版 intra（K1）：输入/输出全部 [1, H, T_alloc, D]。
+
+    _align_seqs 之后每条序列 BT 对齐且首尾相接，全局第 c 个 chunk 恒等于
+    T 轴的行 [c*BT, (c+1)*BT)——gather 是恒等映射，所以这里没有
+    gather/scatter，也不需要 cu_seqlens：块与序列归属无关，序列边界只由
+    K2 的递推关心。死区块用全零输入算出全零输出，无人读取。
+    """
+    B, H, T_alloc, K = q.shape
     V = v.shape[-1]
     BT = chunk_size
-    assert B == 1, f"varlen requires B=1 (packed layout), got B={B}"
+    assert B == 1 and T_alloc % BT == 0
     assert BT >= 16 and BT % 16 == 0
+    NC = T_alloc // BT
 
-    assert_shape(q, (B, T, H, K), "q")
-    assert_shape(k, (B, T, H, K), "k")
-    assert_shape(v, (B, T, H, V), "v")
-    assert_shape(gk, (B, T, H, K), "gk")
-    assert_shape(beta, (B, T, H), "beta")
-
-    N = cu_seqlens.shape[0] - 1
-    T_alloc = T + BT
-
-    pad4d = lambda x: jnp.pad(x, ((0, 0), (0, BT), (0, 0), (0, 0)))
-    q_pad, k_pad, gk_pad, v_pad = pad4d(q), pad4d(k), pad4d(gk), pad4d(v)
-    beta_pad = jnp.pad(beta.reshape(B, T, H, 1), ((0, 0), (0, BT), (0, 0), (0, 0)))
-
-    cu_i32 = cu_seqlens.astype(jnp.int32)
-    seq_lens = jnp.diff(cu_i32)
-    chunks_per_seq = (seq_lens + BT - 1) // BT
-    cum_chunks = jnp.pad(jnp.cumsum(chunks_per_seq), (1, 0))
-    total_chunks = cum_chunks[-1]
-
-    NC_max = len(chunk_indices) if chunk_indices is not None else T // BT + N
-    flat_idx = jnp.arange(NC_max, dtype=jnp.int32)
-    is_valid = flat_idx < total_chunks
-
-    seq_id = jnp.minimum(jnp.searchsorted(cum_chunks[1:], flat_idx, side="right"), N - 1)
-    local_ci = flat_idx - cum_chunks[seq_id]
-    bos = cu_i32[seq_id]
-    # After _align_seqs, every sequence is BT-aligned, so all chunks are full.
-    # No partial-chunk masking needed.
-    chunk_starts = jnp.where(is_valid, bos + local_ci * BT, 0)
-
-    def gather(x_pad, D):
-        def extract(start):
-            return jax.lax.dynamic_slice(x_pad, (0, start, 0, 0), (1, BT, H, D))[0]
-
-        return jax.vmap(extract)(chunk_starts)
-
-    q_c, k_c, gk_c, beta_c, v_c = (
-        gather(q_pad, K),
-        gather(k_pad, K),
-        gather(gk_pad, K),
-        gather(beta_pad, 1),
-        gather(v_pad, V),
-    )
-
-    def _to_bhnd(x):
-        return x.transpose(2, 0, 1, 3)[None]
-
-    q_r, k_r, g_r, beta_r, v_r = (
-        _to_bhnd(q_c),
-        _to_bhnd(k_c),
-        _to_bhnd(gk_c),
-        _to_bhnd(beta_c),
-        _to_bhnd(v_c),
-    )
-
-    grid = (B, H, NC_max)
-
-    def _make_spec(last_dim):
-        return pl.BlockSpec(
-            index_map=lambda i, j, n: (i, j, n, 0, 0), block_shape=(1, 1, 1, BT, last_dim)
+    if use_gate_in_kernel:
+        assert A_log is not None
+        a_r = jnp.broadcast_to(
+            jnp.exp(A_log.astype(jnp.float32))[None, :, None, None], (1, H, 1, K)
         )
+        db = (
+            jnp.zeros((H, K), jnp.float32)
+            if dt_bias is None
+            else dt_bias.astype(jnp.float32).reshape(H, K)
+        )
+        bias_r = db[None, :, None, :]
+        gate_spec = pl.BlockSpec(block_shape=(1, 1, 1, K), index_map=lambda h, c: (0, h, 0, 0))
+    else:
+        a_r, bias_r, gate_spec = None, None, None
 
-    u_r, w_r, qg_r, kg_r, Aqk_r, Akk_inv_r = pl.pallas_call(
+    def _spec(last_dim):
+        return pl.BlockSpec(block_shape=(1, 1, BT, last_dim), index_map=lambda h, c: (0, h, c, 0))
+
+    dt = q.dtype
+    u_u, w_u, qg_u, kg_u, Aqk_u, Akk_u, g_cum_u = pl.pallas_call(
         functools.partial(
             _kda_fwd_intra_kernel,
             chunk_size=BT,
@@ -595,47 +615,35 @@ def kda_fwd_intra(
             scale=scale,
             disable_recompute=disable_recompute,
             safe_gate=safe_gate,
+            APPLY_GATE=use_gate_in_kernel,
+            LOWER_BOUND=lower_bound,
+            NEUMANN_INV=neumann_inv,
         ),
         interpret=get_interpret(),
         out_shape=[
-            jax.ShapeDtypeStruct((B, H, NC_max, BT, V), q.dtype),
-            jax.ShapeDtypeStruct((B, H, NC_max, BT, K), q.dtype),
-            jax.ShapeDtypeStruct((B, H, NC_max, BT, K), q.dtype),
-            jax.ShapeDtypeStruct((B, H, NC_max, BT, K), q.dtype),
-            jax.ShapeDtypeStruct((B, H, NC_max, BT, BT), q.dtype),
-            jax.ShapeDtypeStruct((B, H, NC_max, BT, BT), q.dtype),
+            jax.ShapeDtypeStruct((1, H, T_alloc, V), dt),
+            jax.ShapeDtypeStruct((1, H, T_alloc, K), dt),
+            jax.ShapeDtypeStruct((1, H, T_alloc, K), dt) if disable_recompute else None,
+            jax.ShapeDtypeStruct((1, H, T_alloc, K), dt),
+            jax.ShapeDtypeStruct((1, H, T_alloc, BT), dt),
+            jax.ShapeDtypeStruct((1, H, T_alloc, BT), dt),
+            jax.ShapeDtypeStruct((1, H, T_alloc, K), jnp.float32),
         ],
-        in_specs=[_make_spec(K), _make_spec(K), _make_spec(K), _make_spec(1), _make_spec(V)],
+        in_specs=[_spec(K), _spec(K), _spec(K), _spec(1), _spec(V), gate_spec, gate_spec],
         out_specs=[
-            _make_spec(V),
-            _make_spec(K),
-            _make_spec(K),
-            _make_spec(K),
-            _make_spec(BT),
-            _make_spec(BT),
+            _spec(V),
+            _spec(K),
+            _spec(K) if disable_recompute else None,
+            _spec(K),
+            _spec(BT),
+            _spec(BT),
+            _spec(K),
         ],
-        grid=grid,
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "parallel", "parallel")
-        ),
-    )(q_r, k_r, g_r, beta_r, v_r)
+        grid=(H, NC),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")),
+    )(q, k, gk, beta, v, a_r, bias_r)
 
-    pos = chunk_starts[:, None] + jnp.arange(BT)[None, :]
-    pos = jnp.where(is_valid[:, None], pos, T_alloc - 1)
-    flat_pos = pos.reshape(-1)
-
-    def _scatter(chunks_r, D):
-        chunks = chunks_r[0].transpose(1, 2, 0, 3)
-        flat_chunks = chunks.reshape(-1, H, D)
-        out = jnp.zeros((T_alloc, H, D), dtype=chunks.dtype)
-        out = out.at[flat_pos].add(flat_chunks)
-        return out[:T][None]
-
-    w_out, u_out, kg_out = _scatter(w_r, K), _scatter(u_r, V), _scatter(kg_r, K)
-    Aqk_out, Akk_out = _scatter(Aqk_r, BT), _scatter(Akk_inv_r, BT)
-    qg_out = _scatter(qg_r, K) if disable_recompute else None
-
-    return w_out, u_out, qg_out, kg_out, Aqk_out, Akk_out
+    return w_u, u_u, qg_u, kg_u, Aqk_u, Akk_u, g_cum_u
 
 
 # ============================================================================
@@ -811,6 +819,9 @@ def chunk_gated_delta_rule_fwd_h(
         g_t = None
 
     if gk is not None:
+        # NOTE: the kernel only reads gk[BT-1], but a [1,1,1,K] block is illegal
+        # on TPU (sublane dim must be a multiple of 8 or the full array dim), so
+        # the full [BT, K] block is shipped. The fused path avoids this entirely.
         gk_fp32 = gk.astype(jnp.float32)
         if K_PADSIZE > K:
             gk_fp32 = jnp.pad(gk_fp32, ((0, 0), (0, 0), (0, 0), (0, K_PADSIZE - K)))
@@ -915,6 +926,200 @@ def chunk_gated_delta_rule_fwd_h(
     ht_out = ht_out[:, :, :K, :V] if output_final_state else None
 
     return h_out, v_new_out, ht_out
+
+
+# ============================================================================
+# Fused Stage 3+4: inter-chunk recurrence + output in one kernel.
+# h (chunk-entry state) and v_new (delta-rule residual) stay in VMEM and never
+# round-trip through HBM; o is written directly from the recurrence loop.
+# ============================================================================
+
+
+def _chunk_kda_fused_h_o_kernel(
+    seq_id_ref,      # [NC] prefetch：chunk 属于哪条序列（仅 index_map 消费）
+    start_flag_ref,  # [NC] prefetch：chunk 是否为某条序列的首块（重置状态）
+    end_flag_ref,    # [NC] prefetch：chunk 是否为某条序列的末块（写 final_state）
+    q_ref,  # [1, 1, BT, K]
+    k_ref,  # [1, 1, BT, K]   kg from stage 2 (k * exp2(g_last - g))
+    v_ref,  # [1, 1, BT, V]   u from stage 2 (corrected values)
+    w_ref,  # [1, 1, BT, K]
+    g_ref,  # [1, 1, BT, K]   g_cumsum (fp32, log2 domain)
+    A_ref,  # [1, 1, BT, BT]  Aqk from stage 2
+    h0_ref,  # [1, 1, K, V] or None
+    o_ref,  # [1, 1, BT, V] out
+    ht_ref,  # [1, 1, K, V] out or None
+    scratch_ref,  # [K, V] f32, persistent hidden state
+    *,
+    scale,
+    USE_INITIAL_STATE,
+    STORE_FINAL_STATE,
+):
+    """平铺 chunk grid 版：grid=(H, NC)，c 维按 packed 顺序串行走完全部 chunk。
+
+    总步数 O(T)，与序列条数 N 无关（旧版 grid=(N,H,T/BT) 是 O(N*T)，无效步
+    的 DMA 随 N 线性膨胀）。序列边界由 start/end 标志位驱动；死区 chunk 的
+    输入全零（K1 产物），b_v=0、kg=0，状态与输出天然不受影响，无需 valid 掩码。
+    """
+    idx_c = pl.program_id(1)
+
+    BT = k_ref.shape[2]
+    K, V = k_ref.shape[-1], v_ref.shape[-1]
+
+    @pl.when(start_flag_ref[idx_c] == 1)
+    def _():
+        scratch_ref[...] = jnp.zeros([K, V], dtype=jnp.float32)
+        if USE_INITIAL_STATE:
+            scratch_ref[...] = h0_ref[0, 0].astype(jnp.float32)
+
+    b_S = scratch_ref[...]  # [K, V] chunk 入口状态
+
+    # --- delta-rule 残差（原 v_new）---
+    b_w = w_ref[0, 0].astype(jnp.float32)
+    b_v = jnp.dot(
+        b_w, b_S, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32
+    )
+    b_v = v_ref[0, 0].astype(jnp.float32) - b_v  # [BT, V]
+
+    # --- 输出（原 stage 4），基于 chunk 入口状态 ---
+    b_g = g_ref[0, 0].astype(jnp.float32)  # [BT, K]
+    b_g_ref = b_g[0:1, :]  # [1, K] 参考点（cumsum 最大值）
+    b_qg = q_ref[0, 0].astype(jnp.float32) * exp2(jnp.maximum(b_g - b_g_ref, -126.0))
+    b_h_scaled = b_S * exp2(jnp.maximum(b_g_ref[0], -126.0))[:, None]
+    b_o = scale * jnp.dot(
+        b_qg, b_h_scaled, precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    )
+    m_s = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
+    b_A = jnp.where(m_s, A_ref[0, 0].astype(jnp.float32), 0.0)
+    b_o += jnp.dot(
+        b_A, b_v, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32
+    )
+    o_ref[0, 0] = b_o.astype(o_ref.dtype)
+
+    # --- 状态更新（原 stage 3）---
+    b_gk_last = b_g[BT - 1]  # [K]
+    scratch_ref[...] = b_S * exp2(b_gk_last)[:, None] + jnp.dot(
+        k_ref[0, 0].astype(jnp.float32).T,
+        b_v,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    )
+
+    @pl.when(end_flag_ref[idx_c] == 1)
+    def _():
+        if STORE_FINAL_STATE:
+            ht_ref[0, 0] = scratch_ref[...].astype(ht_ref.dtype)
+
+
+def chunk_kda_fused_h_o(
+    q,          # [1, H, T, K]  统一布局（与 kda_fwd_intra 的输出一致）
+    kg,         # [1, H, T, K]
+    w,          # [1, H, T, K]
+    u,          # [1, H, T, V]
+    g_cumsum,   # [1, H, T, K] f32
+    A,          # [1, H, T, BT]
+    scale,
+    initial_state=None,
+    output_final_state=False,
+    chunk_size=64,
+    cu_seqlens=None,
+):
+    B, H, T, K = q.shape
+    V = u.shape[-1]
+    BT = chunk_size
+
+    assert cu_seqlens is not None
+    assert B == 1 and T % BT == 0
+    N = cu_seqlens.shape[-1] - 1
+
+    K_PADSIZE = int(align_up(K, 128))
+    V_ALIGNED = int(align_up(V, 128))
+    NC = T // BT
+
+    # 输入已是统一布局；只在 K/V 不足 128 时补最后一维。bf16 输入直接进 kernel，
+    # 块内升 fp32——不再在 HBM 里物化 f32 副本。
+    def _padlast(x, D, D_pad):
+        if D_pad > D:
+            return jnp.pad(x, ((0, 0), (0, 0), (0, 0), (0, D_pad - D)))
+        return x
+
+    q_t = _padlast(q, K, K_PADSIZE)
+    k_t = _padlast(kg, K, K_PADSIZE)
+    w_t = _padlast(w, K, K_PADSIZE)
+    v_t = _padlast(u, V, V_ALIGNED)
+    g_t = _padlast(g_cumsum, K, K_PADSIZE)
+    A_t = A
+
+    if initial_state is not None:
+        h0 = initial_state
+        if V_ALIGNED > V:
+            h0 = jnp.pad(h0, ((0, 0), (0, 0), (0, 0), (0, V_ALIGNED - V)))
+        if K_PADSIZE > K:
+            h0 = jnp.pad(h0, ((0, 0), (0, 0), (0, K_PADSIZE - K), (0, 0)))
+    else:
+        h0 = None
+
+    # 平铺 grid 的每 chunk 元数据（O(NC) 个标量，走 SMEM prefetch）：
+    # 所属序列、是否序列首块（重置状态）、是否序列末块（写 final_state）。
+    cu_i32 = cu_seqlens.astype(jnp.int32)
+    chunk_bos = jnp.arange(NC, dtype=jnp.int32) * BT
+    seq_id = jnp.clip(
+        jnp.searchsorted(cu_i32[1:], chunk_bos, side="right"), 0, N - 1
+    ).astype(jnp.int32)
+    start_flag = (chunk_bos == cu_i32[seq_id]).astype(jnp.int32)
+    end_flag = (chunk_bos + BT == cu_i32[seq_id + 1]).astype(jnp.int32)
+
+    _state_index_map = lambda h, c, seq_id_ref, *_: (seq_id_ref[c], h, 0, 0)
+
+    tspec = lambda D: pl.BlockSpec([1, 1, BT, D], index_map=lambda h, c, *_: (0, h, c, 0))
+    h0_blockspec = (
+        pl.BlockSpec([1, 1, K_PADSIZE, V_ALIGNED], index_map=_state_index_map)
+        if initial_state is not None
+        else None
+    )
+    ht_blockspec = (
+        pl.BlockSpec([1, 1, K_PADSIZE, V_ALIGNED], index_map=_state_index_map)
+        if output_final_state
+        else None
+    )
+    ht_spec = (
+        jax.ShapeDtypeStruct([N, H, K_PADSIZE, V_ALIGNED], jnp.float32)
+        if output_final_state
+        else None
+    )
+
+    o_out, ht_out = pl.pallas_call(
+        functools.partial(
+            _chunk_kda_fused_h_o_kernel,
+            scale=scale,
+            USE_INITIAL_STATE=(initial_state is not None),
+            STORE_FINAL_STATE=output_final_state,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(H, NC),
+            in_specs=[
+                tspec(K_PADSIZE),  # q
+                tspec(K_PADSIZE),  # kg
+                tspec(V_ALIGNED),  # u
+                tspec(K_PADSIZE),  # w
+                tspec(K_PADSIZE),  # g_cumsum
+                tspec(BT),  # Aqk
+                h0_blockspec,
+            ],
+            out_specs=[tspec(V_ALIGNED), ht_blockspec],
+            scratch_shapes=[pltpu.VMEM((K_PADSIZE, V_ALIGNED), jnp.float32)],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "arbitrary")
+        ),
+        out_shape=[jax.ShapeDtypeStruct([B, H, T, V_ALIGNED], jnp.float32), ht_spec],
+        interpret=get_interpret(),
+    )(seq_id, start_flag, end_flag, q_t, k_t, v_t, w_t, g_t, A_t, h0)
+
+    o = jnp.transpose(o_out[:, :, :, :V], (0, 2, 1, 3))
+    ht_out = ht_out[:, :, :K, :V] if output_final_state else None
+    return o, ht_out
 
 
 # ============================================================================
@@ -1204,6 +1409,7 @@ def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
         "return_intermediate_states",
         "cp_context",
         "transpose_state_layout",
+        "neumann_inv",
     ),
 )
 def chunk_kda_fwd(
@@ -1228,6 +1434,7 @@ def chunk_kda_fwd(
     return_intermediate_states: bool = False,
     cp_context: None = None,
     transpose_state_layout: bool = False,
+    neumann_inv: bool = True,
 ):
     """KDA chunked forward pass for variable-length sequences (varlen).
 
@@ -1249,16 +1456,6 @@ def chunk_kda_fwd(
     assert use_qk_l2norm_in_kernel is False
     assert cp_context is None
     assert not transpose_state_layout
-
-    # Mirrors fla.ops.kda.chunk_kda
-    if safe_gate and use_gate_in_kernel:
-        if lower_bound is None:
-            raise ValueError(
-                "`lower_bound` must be specified when `safe_gate=True` and "
-                "`use_gate_in_kernel=True`."
-            )
-        if not (-5.0 <= lower_bound < 0.0):
-            raise ValueError(f"`lower_bound` must be in the safe range [-5, 0), got {lower_bound}.")
     assert not return_intermediate_states
     assert not disable_recompute
 
@@ -1275,15 +1472,13 @@ def chunk_kda_fwd(
     # Varlen alignment
     _orig_cu_seqlens = cu_seqlens
     T_input = T
-    with jax.named_scope("kda_align"):
-        [q, k, v, g], [beta], cu_seqlens, _ = _align_seqs(
-            [q, k, v, g],
-            [beta],
-            cu_seqlens,
-            align=BT,
-        )
+    [q, k, v, g], [beta], cu_seqlens, _ = _align_seqs(
+        [q, k, v, g],
+        [beta],
+        cu_seqlens,
+        align=BT,
+    )
     T = q.shape[1]
-    chunk_indices = prepare_chunk_indices(cu_seqlens, BT, max_T=T)
 
     assert T % BT == 0
 
@@ -1302,85 +1497,63 @@ def chunk_kda_fwd(
         valid_mask = in_range.any(axis=0)  # [T]
         g = jnp.where(valid_mask[None, :, None, None], g, -1e4)
 
-    # Step 1: Gate cumsum
+    # 统一寻址：所有张量转成 [1, H, T, D] 布局，一次转置进场；
+    # K1（intra）和 K2（递推+输出）之间零 gather/scatter、零转置、零 f32 物化。
+    # （T 已按 BT 对齐，尾部 +BT 的垃圾桶 pad 随 gather 一起退役了。）
+    to_u = lambda x: jnp.transpose(x, (0, 2, 1, 3))
+    in_dtype = q.dtype
+    q_u, k_u, v_u, g_u = to_u(q), to_u(k), to_u(v), to_u(g)
+    beta_u = to_u(beta.reshape(B, T, H, 1))
+
+    # Step 1+2 fused: gate activation + chunk-local cumsum run inside the intra
+    # kernel on the [BT, K] block already in VMEM; g_act never hits HBM and the
+    # standalone cumsum kernel (plus its gather/scatter glue) is gone.
     if use_gate_in_kernel:
         assert A_log is not None
-        with jax.named_scope("kda_gate_cumsum"):
-            g_cumsum = kda_gate_chunk_cumsum(
-                g=g,
-                A_log=A_log,
-                chunk_size=BT,
-                scale=_RCP_LN2,
-                dt_bias=dt_bias,
-                lower_bound=lower_bound,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-            )
-    else:
-        with jax.named_scope("kda_gate_cumsum"):
-            g_cumsum = pallas_kda_gate_cumsum(
-                g=g,
-                scale=_RCP_LN2,
-                chunk_size=chunk_size,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-            )
+    w_u, u_u, qg_u, kg_u, Aqk_u, Akk_u, gcum_u = kda_fwd_intra(
+        q_u,
+        k_u,
+        v_u,
+        gk=g_u,
+        beta=beta_u,
+        scale=scale,
+        safe_gate=safe_gate,
+        chunk_size=BT,
+        use_gate_in_kernel=use_gate_in_kernel,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        neumann_inv=neumann_inv,
+    )
 
-    # Step 2: Intra-chunk solve
-    with jax.named_scope("kda_intra"):
-        w, u, qg, kg, Aqk, Akk = kda_fwd_intra(
-            q=q,
-            k=k,
-            v=v,
-            gk=g_cumsum,
-            beta=beta,
-            scale=scale,
-            safe_gate=safe_gate,
-            chunk_size=BT,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-        )
-
-    # Step 3: Inter-chunk state propagation
-    with jax.named_scope("kda_fwd_h"):
-        h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
-            k=kg,
-            w=w,
-            u=u,
-            gk=g_cumsum,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            chunk_size=BT,
-            use_exp2=True,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-        )
-
-    # Step 4: Output computation
-    with jax.named_scope("kda_o_gk"):
-        o = chunk_kda_fwd_o_gk(
-            q=q,
-            v=v_new,
-            g=g_cumsum,
-            A=Aqk,
-            h=h,
-            scale=scale,
-            chunk_size=BT,
-            use_exp2=True,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-        )
+    # Step 3+4 fused: inter-chunk recurrence and output in one kernel.
+    # h / v_new stay in VMEM and never round-trip through HBM.
+    o, final_state = chunk_kda_fused_h_o(
+        q=q_u,
+        kg=kg_u,
+        w=w_u,
+        u=u_u,
+        g_cumsum=gcum_u,
+        A=Aqk_u,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=BT,
+        cu_seqlens=cu_seqlens,
+    )
 
     # Cast output back to input dtype (e.g. bfloat16)
-    o = o.astype(q.dtype)
+    o = o.astype(in_dtype)
 
     # Unalign output
-    with jax.named_scope("kda_unalign"):
-        o = _unalign_output(o, _orig_cu_seqlens, cu_seqlens, T_input)
+    o = _unalign_output(o, _orig_cu_seqlens, cu_seqlens, T_input)
+
+    # 返回给 backward 的三个量转回 [1, T, H, D] 契约布局
+    un_u = lambda x: jnp.transpose(x, (0, 2, 1, 3))
+    Aqk, Akk = un_u(Aqk_u), un_u(Akk_u)
+    g_cumsum = None if use_gate_in_kernel else un_u(gcum_u)
 
     # Release intermediates
     w, u, qg, kg, v_new, h = None, None, None, None, None, None
-    if use_gate_in_kernel:
-        g_cumsum = None
 
     return o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg, v_new, h, initial_state
