@@ -2266,6 +2266,8 @@ def chunk_kda_fwd(
              BT=64/128 而非 FlashKDA 的 C=16（后者服务 fp16 数值范围与
              GPU SM 占用，TPU 不适用）。
       False: elementwise 衰减张量 + 逐行前向消元（上游原始路径）。
+      注意：Neumann 求解仅在有界 gate 下数值稳定，无界 softplus 不可用——
+      不要把求解方法从 safe_gate 里解耦出来单独提供给 generic 路径。
 
     搬得多 —— ``fuse`` / ``unified_layout``
       fuse=True:  stage1+2（gate 激活+cumsum）融合进 intra kernel；
@@ -2344,7 +2346,10 @@ def chunk_kda_fwd(
     # head_block：原生 [1,T,H,D] + 全 H 块（要求 H%8==0，否则自动回退 unified）。
     # 同时实现：转置消除、grid 步数 ÷H、K2 块内 H 条独立链交错。仅推理路径
     # （不产 Akk；qg/disable_recompute 不支持——上方已 assert）。
-    use_hb = head_block and fuse and (H % 8 == 0)
+    # hb 快路径限定 safe_gate：sg=False 的 elementwise 衰减张量（[BT,BT,K] fp32）
+    # 在全 H 块的展开循环下活性重叠，K=128/H=16 时 scoped VMEM 溢出（45MB>32MB）。
+    # generic 路径自动回退 unified_layout。
+    use_hb = head_block and fuse and (H % 8 == 0) and safe_gate
 
     if fuse and use_hb:
         w_n, u_n, kg_n, Aqk_n, gcum_n = kda_fwd_intra_hb(
