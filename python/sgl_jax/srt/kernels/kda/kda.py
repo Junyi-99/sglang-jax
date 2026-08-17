@@ -368,42 +368,19 @@ def _neumann_fused_wide(L, z, BT):
     return z
 
 
-# 统一寻址版：数组是 [1, H, T_alloc, D]，grid=(H, NC)，块 c 恒等映射到行 [c*BT,(c+1)*BT)。
-# kernel 里的 ref 是 BlockSpec 切好的一块 [1, 1, BT, D]。
-def _kda_fwd_intra_kernel(
-    q_ref, # [1, 1, BT, K] = [1, 1, 64, 128]
-    k_ref, # [1, 1, BT, K]
-    g_ref, # [1, 1, BT, K]
-    beta_ref, # [1, 1, BT, 1]
-    v_ref, # [1, 1, BT, V]
-    a_ref,    # [1, 1, 1, K] exp(A_log) 按 head 广播；APPLY_GATE=False 时为 None
-    bias_ref, # [1, 1, 1, K] dt_bias；APPLY_GATE=False 时为 None
-    u_out_ref, # [1, 1, BT, V]
-    w_out_ref, # [1, 1, 1, BT, K]
-    qg_out_ref,# [1, 1, 1, BT, V]
-    kg_out_ref,#
-    Aqk_out_ref,#
-    Akk_inv_out_ref,#
-    g_cum_out_ref,  # [1, 1, 1, BT, K] f32：融合进来的 stage 1 输出，给 stage 3+4 用
-    *,
-    chunk_size, # 64
-    head_dim, # K=128
-    value_dim,# V=128
-    scale,
-    disable_recompute,
-    safe_gate,
-    APPLY_GATE,   # 融合的 stage 1：是否在 kernel 内做 gate 激活
-    LOWER_BOUND,  # None -> -exp(A)*softplus；float -> lb*sigmoid
-    PRE_CUMSUM,   # True（fuse=False ablation 路径）：g 已是 stage-1 独立 kernel 的 log2 前缀和
+def _intra_head_math(
+    q, k, g, beta, v, a_vec, bias_vec, *,
+    chunk_size, head_dim, value_dim, scale, safe_gate,
+    APPLY_GATE, LOWER_BOUND, PRE_CUMSUM, WANT_AINV,
 ):
-    # q_r, k_r, g_r, v_r:
-    # beta_r: [B, H, N, D, 1]
-    dtype = q_ref.dtype
-    q = q_ref[0, 0] # [1,1,64,128] --> [64, 128] # 索引掉前两个 1 维
-    k = k_ref[0, 0] # [64, 128]
-    g = g_ref[0, 0] # [64, 128] raw gate（APPLY_GATE 时）或已激活的 log 衰减；均为"逐步值"，cumsum 在下面做
-    beta = beta_ref[0, 0]  # [64, 1]
-    v = v_ref[0, 0]  # [64, 128]
+    """单 head 单 chunk 的 intra 数学（纯函数，两种布局 kernel 共用）。
+
+    输入：q/k/g [BT,K]、beta [BT,1]、v [BT,V]、a_vec/bias_vec [K] 或 None。
+    返回：(u [BT,V], w [BT,K], kg [BT,K], Aqk [BT,BT], A_inv [BT,BT]|None, g_cum [BT,K] f32)。
+    WANT_AINV=False（推理默认）：safe_gate 路径的 fused-wide RHS 去掉 identity 块
+    （320→256 列），不计算也不输出 (I+L)^{-1}。
+    """
+    dtype = q.dtype
 
     BT = chunk_size # 64
 
@@ -411,8 +388,8 @@ def _kda_fwd_intra_kernel(
     g_f32 = g.astype(jnp.float32)
     if not PRE_CUMSUM:
         if APPLY_GATE:
-            b_a = a_ref[0, 0, 0].astype(jnp.float32)        # [K] exp(A_log[h])，逐通道广播
-            b_bias = bias_ref[0, 0, 0].astype(jnp.float32)  # [K] dt_bias[h]
+            b_a = a_vec.astype(jnp.float32)        # [K] exp(A_log[h])，逐通道广播
+            b_bias = bias_vec.astype(jnp.float32)  # [K] dt_bias[h]
             if LOWER_BOUND is None:
                 g_f32 = -b_a * jax.nn.softplus(g_f32 + b_bias)
             else:
@@ -427,7 +404,7 @@ def _kda_fwd_intra_kernel(
             bot = g_f32[stride:, :] + g_f32[:-stride, :]
             g_f32 = jnp.concatenate([top, bot], axis=0)
         g_f32 = g_f32 * _RCP_LN2  # [64, 128] 转 log2 域
-    g_cum_out_ref[0, 0] = g_f32.astype(g_cum_out_ref.dtype)
+    g_cum = g_f32
     q_f32 = q.astype(jnp.float32)
     k_f32 = k.astype(jnp.float32)
     beta_f32 = beta.astype(jnp.float32)
@@ -518,29 +495,76 @@ def _kda_fwd_intra_kernel(
     if safe_gate:
         # Kimi-K3 special branch (bounded gate, lower_bound validated in
         # [-5, 0)): fused-wide finite Neumann, one bf16 MXU pass.  (PR#2)
-        z = jnp.concatenate([identity, v_beta, k_eg_beta], axis=-1)
+        parts = ([identity] if WANT_AINV else []) + [v_beta, k_eg_beta]
+        z = jnp.concatenate(parts, axis=-1)
         z = _neumann_fused_wide(L, z, BT)
-        A_inv = z[:, :BT]
-        u = z[:, BT : BT + value_dim]
-        w = z[:, BT + value_dim :]
+        off = BT if WANT_AINV else 0
+        A_inv = z[:, :BT] if WANT_AINV else None
+        u = z[:, off : off + value_dim]
+        w = z[:, off + value_dim :]
     else:
         # General KDA: sequential forward substitution (upstream original).
-        combined_b = jnp.concatenate([v_beta, k_eg_beta, identity], axis=-1)
+        parts = [v_beta, k_eg_beta] + ([identity] if WANT_AINV else [])
+        combined_b = jnp.concatenate(parts, axis=-1)
         combined_x = _solve_unit_lower_triangular(L, combined_b)
 
         u = combined_x[:, :value_dim]
         w = combined_x[:, value_dim : value_dim + head_dim]
-        A_inv = combined_x[:, value_dim + head_dim :]
+        A_inv = combined_x[:, value_dim + head_dim :] if WANT_AINV else None
 
     g_last = g_f32[BT - 1 : BT, :]
     kg = k_f32 * exp2(g_last - g_f32)
 
+    return u, w, kg, Aqk, A_inv, g_cum
+
+
+# 统一寻址版：数组是 [1, H, T_alloc, D]，grid=(H, NC)，块 c 恒等映射到行 [c*BT,(c+1)*BT)。
+# kernel 里的 ref 是 BlockSpec 切好的一块 [1, 1, BT, D]。
+def _kda_fwd_intra_kernel(
+    q_ref, # [1, 1, BT, K] = [1, 1, 64, 128]
+    k_ref, # [1, 1, BT, K]
+    g_ref, # [1, 1, BT, K]
+    beta_ref, # [1, 1, BT, 1]
+    v_ref, # [1, 1, BT, V]
+    a_ref,    # [1, 1, 1, K] exp(A_log) 按 head 广播；APPLY_GATE=False 时为 None
+    bias_ref, # [1, 1, 1, K] dt_bias；APPLY_GATE=False 时为 None
+    u_out_ref, # [1, 1, BT, V]
+    w_out_ref, # [1, 1, 1, BT, K]
+    qg_out_ref,# [1, 1, 1, BT, V]
+    kg_out_ref,#
+    Aqk_out_ref,#
+    Akk_inv_out_ref,#
+    g_cum_out_ref,  # [1, 1, 1, BT, K] f32：融合进来的 stage 1 输出，给 stage 3+4 用
+    *,
+    chunk_size, # 64
+    head_dim, # K=128
+    value_dim,# V=128
+    scale,
+    disable_recompute,
+    safe_gate,
+    APPLY_GATE,   # 融合的 stage 1：是否在 kernel 内做 gate 激活
+    LOWER_BOUND,  # None -> -exp(A)*softplus；float -> lb*sigmoid
+    PRE_CUMSUM,   # True（fuse=False ablation 路径）：g 已是 stage-1 独立 kernel 的 log2 前缀和
+):
+    # q_r, k_r, g_r, v_r:
+    # beta_r: [B, H, N, D, 1]
+    dtype = q_ref.dtype
+    a_vec = a_ref[0, 0, 0] if APPLY_GATE else None
+    bias_vec = bias_ref[0, 0, 0] if APPLY_GATE else None
+    u, w, kg, Aqk, A_inv, g_cum = _intra_head_math(
+        q_ref[0, 0], k_ref[0, 0], g_ref[0, 0], beta_ref[0, 0], v_ref[0, 0],
+        a_vec, bias_vec,
+        chunk_size=chunk_size, head_dim=head_dim, value_dim=value_dim, scale=scale,
+        safe_gate=safe_gate, APPLY_GATE=APPLY_GATE, LOWER_BOUND=LOWER_BOUND,
+        PRE_CUMSUM=PRE_CUMSUM, WANT_AINV=True,
+    )
+    g_cum_out_ref[0, 0] = g_cum.astype(g_cum_out_ref.dtype)
     u_out_ref[0, 0] = u.astype(u_out_ref.dtype)
     w_out_ref[0, 0] = w.astype(w_out_ref.dtype)
     if disable_recompute:
         # qg only exists to let backward skip recomputation; otherwise the
         # output slot is None and nothing is written (saves a full HBM store).
-        qg = q_f32 * exp2(g_f32)
+        qg = q_ref[0, 0].astype(jnp.float32) * exp2(g_cum)
         qg_out_ref[0, 0] = qg.astype(qg_out_ref.dtype)
     kg_out_ref[0, 0] = kg.astype(kg_out_ref.dtype)
     Aqk_out_ref[0, 0] = Aqk.astype(Aqk_out_ref.dtype)
@@ -1275,47 +1299,44 @@ def chunk_gated_delta_rule_fwd_h_flat(
 # ============================================================================
 
 
-def _fused_h_o_chunk_step(q_ref, k_ref, v_ref, w_ref, g_ref, A_ref, o_ref, scratch_ref, scale):
-    """单个 chunk 的融合递推步（两种 grid 的公共体）。
-
-    读 chunk 入口状态 S（scratch），算 delta-rule 残差 v_new、输出 o
-    （原 stage 4），再做状态更新（原 stage 3）。h/v_new 全程留在
-    VMEM/寄存器，不出 HBM。
-    """
-    BT = k_ref.shape[2]
-    b_S = scratch_ref[...]  # [K, V] chunk 入口状态
-
-    # --- delta-rule 残差（原 v_new）---
-    b_w = w_ref[0, 0].astype(jnp.float32)
+def _fused_step_math(q, kk, v, w, g, A, S, scale):
+    """单 head 单 chunk 的融合递推步（纯函数）：返回 (o [BT,V], S_new [K,V])。"""
+    BT = q.shape[0]
     b_v = jnp.dot(
-        b_w, b_S, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32
+        w.astype(jnp.float32), S,
+        precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
     )
-    b_v = v_ref[0, 0].astype(jnp.float32) - b_v  # [BT, V]
+    b_v = v.astype(jnp.float32) - b_v  # [BT, V] delta-rule 残差（原 v_new）
 
-    # --- 输出（原 stage 4），基于 chunk 入口状态 ---
-    b_g = g_ref[0, 0].astype(jnp.float32)  # [BT, K]
-    b_g_ref = b_g[0:1, :]  # [1, K] 参考点（cumsum 最大值）
-    b_qg = q_ref[0, 0].astype(jnp.float32) * exp2(jnp.maximum(b_g - b_g_ref, -126.0))
-    b_h_scaled = b_S * exp2(jnp.maximum(b_g_ref[0], -126.0))[:, None]
+    b_g = g.astype(jnp.float32)
+    b_g_ref = b_g[0:1, :]
+    b_qg = q.astype(jnp.float32) * exp2(jnp.maximum(b_g - b_g_ref, -126.0))
+    b_h_scaled = S * exp2(jnp.maximum(b_g_ref[0], -126.0))[:, None]
     b_o = scale * jnp.dot(
-        b_qg, b_h_scaled, precision=jax.lax.Precision.HIGHEST,
-        preferred_element_type=jnp.float32,
+        b_qg, b_h_scaled,
+        precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
     )
     m_s = jnp.arange(BT)[:, None] >= jnp.arange(BT)[None, :]
-    b_A = jnp.where(m_s, A_ref[0, 0].astype(jnp.float32), 0.0)
+    b_A = jnp.where(m_s, A.astype(jnp.float32), 0.0)
     b_o += jnp.dot(
         b_A, b_v, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32
     )
-    o_ref[0, 0] = b_o.astype(o_ref.dtype)
 
-    # --- 状态更新（原 stage 3）---
-    b_gk_last = b_g[BT - 1]  # [K]
-    scratch_ref[...] = b_S * exp2(b_gk_last)[:, None] + jnp.dot(
-        k_ref[0, 0].astype(jnp.float32).T,
-        b_v,
-        precision=jax.lax.Precision.HIGHEST,
-        preferred_element_type=jnp.float32,
+    S_new = S * exp2(b_g[BT - 1])[:, None] + jnp.dot(
+        kk.astype(jnp.float32).T, b_v,
+        precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32,
     )
+    return b_o, S_new
+
+
+def _fused_h_o_chunk_step(q_ref, k_ref, v_ref, w_ref, g_ref, A_ref, o_ref, scratch_ref, scale):
+    """旧布局薄壳：读 [1,1,BT,*] refs，调纯函数，写回。"""
+    b_o, S_new = _fused_step_math(
+        q_ref[0, 0], k_ref[0, 0], v_ref[0, 0], w_ref[0, 0], g_ref[0, 0], A_ref[0, 0],
+        scratch_ref[...], scale,
+    )
+    o_ref[0, 0] = b_o.astype(o_ref.dtype)
+    scratch_ref[...] = S_new
 
 
 def _chunk_kda_fused_h_o_kernel(
@@ -1865,6 +1886,212 @@ def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
 # ============================================================================
 
 
+# ============================================================================
+# Native-layout head-block (hb) 模式：kernel 直接消费 [1, T, H, D]
+#
+# 关键点：全 H 块 [1, BT, H, D] 的最后两维 (H, D) 在 H % 8 == 0 时满足 TPU
+# tiling 规则——单 head 块 [1, BT, 1, D] 才是非法的。由此：
+#   1. 入场/出场转置消失（~420MB @ headline）——布局天然对齐生产者；
+#   2. grid 从 (H, NC) 塌缩到 (NC,)，步数 ÷H，摊薄 ~1.1µs/步的固定开销；
+#   3. K2 块内 H 条独立递推链可被调度器交错，填充依赖 bubble。
+# 推理模式默认不计算/不返回 backward 中间量（Akk 不再求，fused-wide RHS
+# 320→256 列；见 return_backward_intermediates）。
+# ============================================================================
+
+
+def _kda_fwd_intra_kernel_hb(
+    q_ref,     # [1, BT, H, K]
+    k_ref,     # [1, BT, H, K]
+    g_ref,     # [1, BT, H, K]
+    beta_ref,  # [1, BT, H, 1]
+    v_ref,     # [1, BT, H, V]
+    a_ref,     # [H, K] 或 None
+    bias_ref,  # [H, K] 或 None
+    u_out_ref,     # [1, BT, H, V]
+    w_out_ref,     # [1, BT, H, K]
+    kg_out_ref,    # [1, BT, H, K]
+    Aqk_out_ref,   # [1, BT, H, BT]
+    g_cum_out_ref, # [1, BT, H, K] f32
+    *,
+    chunk_size,
+    head_dim,
+    value_dim,
+    scale,
+    safe_gate,
+    APPLY_GATE,
+    LOWER_BOUND,
+    NUM_HEADS,
+):
+    for h in range(NUM_HEADS):
+        a_vec = a_ref[h] if APPLY_GATE else None
+        bias_vec = bias_ref[h] if APPLY_GATE else None
+        u, w, kg, Aqk, _, g_cum = _intra_head_math(
+            q_ref[0, :, h, :], k_ref[0, :, h, :], g_ref[0, :, h, :],
+            beta_ref[0, :, h, :], v_ref[0, :, h, :], a_vec, bias_vec,
+            chunk_size=chunk_size, head_dim=head_dim, value_dim=value_dim,
+            scale=scale, safe_gate=safe_gate, APPLY_GATE=APPLY_GATE,
+            LOWER_BOUND=LOWER_BOUND, PRE_CUMSUM=False, WANT_AINV=False,
+        )
+        u_out_ref[0, :, h, :] = u.astype(u_out_ref.dtype)
+        w_out_ref[0, :, h, :] = w.astype(w_out_ref.dtype)
+        kg_out_ref[0, :, h, :] = kg.astype(kg_out_ref.dtype)
+        Aqk_out_ref[0, :, h, :] = Aqk.astype(Aqk_out_ref.dtype)
+        g_cum_out_ref[0, :, h, :] = g_cum.astype(g_cum_out_ref.dtype)
+
+
+def kda_fwd_intra_hb(
+    q, k, v, gk, beta, scale, chunk_size=64, safe_gate=False,
+    use_gate_in_kernel=False, A_log=None, dt_bias=None, lower_bound=None,
+):
+    """hb 版 K1：输入输出全部 [1, T, H, D] 原生布局，grid=(NC,)。"""
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    BT = chunk_size
+    assert B == 1 and T % BT == 0 and H % 8 == 0
+    NC = T // BT
+
+    beta4 = beta.reshape(B, T, H, 1)
+    if use_gate_in_kernel:
+        assert A_log is not None
+        a_r = jnp.broadcast_to(jnp.exp(A_log.astype(jnp.float32))[:, None], (H, K))
+        bias_r = (
+            jnp.zeros((H, K), jnp.float32)
+            if dt_bias is None
+            else dt_bias.astype(jnp.float32).reshape(H, K)
+        )
+        gate_spec = pl.BlockSpec(block_shape=(H, K), index_map=lambda c: (0, 0))
+    else:
+        a_r, bias_r, gate_spec = None, None, None
+
+    def _spec(last_dim):
+        return pl.BlockSpec(block_shape=(1, BT, H, last_dim), index_map=lambda c: (0, c, 0, 0))
+
+    dt = q.dtype
+    u4, w4, kg4, Aqk4, g_cum4 = pl.pallas_call(
+        functools.partial(
+            _kda_fwd_intra_kernel_hb,
+            chunk_size=BT, head_dim=K, value_dim=V, scale=scale,
+            safe_gate=safe_gate, APPLY_GATE=use_gate_in_kernel,
+            LOWER_BOUND=lower_bound, NUM_HEADS=H,
+        ),
+        interpret=get_interpret(),
+        out_shape=[
+            jax.ShapeDtypeStruct((1, T, H, V), dt),
+            jax.ShapeDtypeStruct((1, T, H, K), dt),
+            jax.ShapeDtypeStruct((1, T, H, K), dt),
+            jax.ShapeDtypeStruct((1, T, H, BT), dt),
+            jax.ShapeDtypeStruct((1, T, H, K), jnp.float32),
+        ],
+        in_specs=[_spec(K), _spec(K), _spec(K), _spec(1), _spec(V), gate_spec, gate_spec],
+        out_specs=[_spec(V), _spec(K), _spec(K), _spec(BT), _spec(K)],
+        grid=(NC,),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+    )(q, k, gk, beta4, v, a_r, bias_r)
+    return w4, u4, kg4, Aqk4, g_cum4
+
+
+def _chunk_kda_fused_h_o_kernel_hb(
+    seq_id_ref,      # [NC] prefetch
+    start_flag_ref,  # [NC]
+    end_flag_ref,    # [NC]
+    q_ref,   # [1, BT, H, K]
+    k_ref,   # [1, BT, H, K]  kg
+    v_ref,   # [1, BT, H, V]  u
+    w_ref,   # [1, BT, H, K]
+    g_ref,   # [1, BT, H, K]  g_cumsum f32
+    A_ref,   # [1, BT, H, BT]
+    h0_ref,  # [1, H, K, V] 或 None
+    o_ref,   # [1, BT, H, V] out（直接 in_dtype 落盘）
+    ht_ref,  # [1, H, K, V] out 或 None
+    scratch_ref,  # [H, K, V] f32，全部 head 的状态常驻 VMEM
+    *,
+    scale,
+    USE_INITIAL_STATE,
+    STORE_FINAL_STATE,
+    NUM_HEADS,
+):
+    idx_c = pl.program_id(0)
+
+    @pl.when(start_flag_ref[idx_c] == 1)
+    def _():
+        scratch_ref[...] = jnp.zeros_like(scratch_ref)
+        if USE_INITIAL_STATE:
+            scratch_ref[...] = h0_ref[0].astype(jnp.float32)
+
+    # H 条递推链相互独立：Python 展开后调度器可交错，填充依赖 bubble
+    for h in range(NUM_HEADS):
+        b_o, S_new = _fused_step_math(
+            q_ref[0, :, h, :], k_ref[0, :, h, :], v_ref[0, :, h, :],
+            w_ref[0, :, h, :], g_ref[0, :, h, :], A_ref[0, :, h, :],
+            scratch_ref[h], scale,
+        )
+        o_ref[0, :, h, :] = b_o.astype(o_ref.dtype)
+        scratch_ref[h] = S_new
+
+    @pl.when(end_flag_ref[idx_c] == 1)
+    def _():
+        if STORE_FINAL_STATE:
+            ht_ref[0] = scratch_ref[...].astype(ht_ref.dtype)
+
+
+def chunk_kda_fused_h_o_hb(
+    q, kg, w, u, g_cumsum, A, scale,
+    initial_state=None, output_final_state=False, chunk_size=64, cu_seqlens=None,
+):
+    """hb 版 K2：输入 [1,T,H,D] 原生，grid=(NC,) 串行，o 以输入 dtype 直接落盘。"""
+    B, T, H, K = q.shape
+    V = u.shape[-1]
+    BT = chunk_size
+    assert cu_seqlens is not None
+    assert B == 1 and T % BT == 0 and H % 8 == 0
+    N = cu_seqlens.shape[-1] - 1
+    NC = T // BT
+
+    cu_i32 = cu_seqlens.astype(jnp.int32)
+    chunk_bos = jnp.arange(NC, dtype=jnp.int32) * BT
+    seq_id = jnp.clip(
+        jnp.searchsorted(cu_i32[1:], chunk_bos, side="right"), 0, N - 1
+    ).astype(jnp.int32)
+    start_flag = (chunk_bos == cu_i32[seq_id]).astype(jnp.int32)
+    end_flag = (chunk_bos + BT == cu_i32[seq_id + 1]).astype(jnp.int32)
+
+    def _spec(last_dim):
+        return pl.BlockSpec(block_shape=(1, BT, H, last_dim), index_map=lambda c, *_: (0, c, 0, 0))
+
+    _state_map = lambda c, seq_id_ref, *_: (seq_id_ref[c], 0, 0, 0)
+    h0_blockspec = (
+        pl.BlockSpec([1, H, K, V], index_map=_state_map) if initial_state is not None else None
+    )
+    ht_blockspec = (
+        pl.BlockSpec([1, H, K, V], index_map=_state_map) if output_final_state else None
+    )
+    ht_spec = (
+        jax.ShapeDtypeStruct([N, H, K, V], jnp.float32) if output_final_state else None
+    )
+
+    o_out, ht_out = pl.pallas_call(
+        functools.partial(
+            _chunk_kda_fused_h_o_kernel_hb,
+            scale=scale,
+            USE_INITIAL_STATE=(initial_state is not None),
+            STORE_FINAL_STATE=output_final_state,
+            NUM_HEADS=H,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(NC,),
+            in_specs=[_spec(K), _spec(K), _spec(V), _spec(K), _spec(K), _spec(BT), h0_blockspec],
+            out_specs=[_spec(V), ht_blockspec],
+            scratch_shapes=[pltpu.VMEM((H, K, V), jnp.float32)],
+        ),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
+        out_shape=[jax.ShapeDtypeStruct([1, T, H, V], q.dtype), ht_spec],
+        interpret=get_interpret(),
+    )(seq_id, start_flag, end_flag, q, kg, u, w, g_cumsum, A, initial_state)
+
+    return o_out, ht_out
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -1882,6 +2109,8 @@ def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
         "fuse",
         "unified_layout",
         "flat_grid",
+        "head_block",
+        "return_backward_intermediates",
     ),
 )
 def chunk_kda_fwd(
@@ -1909,6 +2138,8 @@ def chunk_kda_fwd(
     fuse: bool = True,
     unified_layout: bool = True,
     flat_grid: bool = True,
+    head_block: bool = True,
+    return_backward_intermediates: bool = False,
 ):
     """KDA chunked forward（varlen packed，B=1，cu_seqlens 必传）。
 
@@ -2000,7 +2231,28 @@ def chunk_kda_fwd(
 
     in_dtype = q.dtype
 
-    if fuse:
+    # head_block：原生 [1,T,H,D] + 全 H 块（要求 H%8==0，否则自动回退 unified）。
+    # 同时实现：转置消除、grid 步数 ÷H、K2 块内 H 条独立链交错。仅推理路径
+    # （不产 Akk；qg/disable_recompute 不支持——上方已 assert）。
+    use_hb = head_block and fuse and (H % 8 == 0)
+
+    if fuse and use_hb:
+        w_n, u_n, kg_n, Aqk_n, gcum_n = kda_fwd_intra_hb(
+            q, k, v, gk=g, beta=beta, scale=scale, chunk_size=BT,
+            safe_gate=safe_gate, use_gate_in_kernel=use_gate_in_kernel,
+            A_log=A_log, dt_bias=dt_bias, lower_bound=lower_bound,
+        )
+        o, final_state = chunk_kda_fused_h_o_hb(
+            q=q, kg=kg_n, w=w_n, u=u_n, g_cumsum=gcum_n, A=Aqk_n, scale=scale,
+            initial_state=initial_state, output_final_state=output_final_state,
+            chunk_size=BT, cu_seqlens=cu_seqlens,
+        )
+        Aqk = Aqk_n if return_backward_intermediates else None
+        Akk = None  # hb 推理路径不计算 (I+L)^{-1}
+        g_cumsum = (
+            gcum_n if (return_backward_intermediates and not use_gate_in_kernel) else None
+        )
+    elif fuse:
         if unified_layout:
             # 统一寻址：一次转置进 [1, H, T, D]，K1/K2 之间零拷贝
             to_u = lambda x: jnp.transpose(x, (0, 2, 1, 3))
@@ -2017,9 +2269,12 @@ def chunk_kda_fwd(
                 initial_state=initial_state, output_final_state=output_final_state,
                 chunk_size=BT, cu_seqlens=cu_seqlens, unified_in=True, flat_grid=flat_grid,
             )
-            un_u = lambda x: jnp.transpose(x, (0, 2, 1, 3))
-            Aqk, Akk = un_u(Aqk_u), un_u(Akk_u)
-            g_cumsum = None if use_gate_in_kernel else un_u(gcum_u)
+            if return_backward_intermediates:
+                un_u = lambda x: jnp.transpose(x, (0, 2, 1, 3))
+                Aqk, Akk = un_u(Aqk_u), un_u(Akk_u)
+                g_cumsum = None if use_gate_in_kernel else un_u(gcum_u)
+            else:
+                Aqk, Akk, g_cumsum = None, None, None
         else:
             # 融合但历史寻址（ablation：量化 gather/scatter 的代价）
             w_, u_, qg_, kg_, Aqk, Akk, gcum_ = kda_fwd_intra(
@@ -2034,6 +2289,8 @@ def chunk_kda_fwd(
                 chunk_size=BT, cu_seqlens=cu_seqlens, unified_in=False, flat_grid=flat_grid,
             )
             g_cumsum = None if use_gate_in_kernel else gcum_
+            if not return_backward_intermediates:
+                Aqk, Akk, g_cumsum = None, None, None
     else:
         # 上游原始 4-stage 流水线（ablation 基线）
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT, max_T=T)
@@ -2065,6 +2322,8 @@ def chunk_kda_fwd(
             use_exp2=True, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
         )
         g_cumsum = None if use_gate_in_kernel else g_cumsum_
+        if not return_backward_intermediates:
+            Aqk, Akk, g_cumsum = None, None, None
 
     # Cast output back to input dtype (e.g. bfloat16)
     o = o.astype(in_dtype)
