@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import os
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
@@ -353,6 +355,10 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         A_log = layer.A_log.value.reshape(H)
         dt_bias = layer.dt_bias.value.reshape(H, -1)
         scale = scale if scale is not None else layer.scale
+        # 有界 gate 模型（gate_lower_bound 非 None）启用 safe_gate 快路径；无界 gate 保持 generic。
+        # KDA_FORCE_BASELINE=1 时全关（≡上游原始 kernel 路径），用于 A/B 对照，gate 语义不变。
+        lower_bound = getattr(layer, "kda_gate_lower_bound", None)
+        opt_on = os.environ.get("KDA_FORCE_BASELINE") != "1"
 
         def _chunk_kda_call(q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias):
             o, final_state, *_ = chunk_kda(
@@ -368,6 +374,12 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                 use_gate_in_kernel=True,
                 A_log=A_log,
                 dt_bias=dt_bias,
+                safe_gate=(lower_bound is not None) and opt_on,
+                lower_bound=lower_bound,
+                fuse=opt_on,
+                unified_layout=opt_on,
+                flat_grid=opt_on,
+                head_block=opt_on,
             )
             return o, final_state
 

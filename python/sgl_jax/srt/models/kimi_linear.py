@@ -251,6 +251,8 @@ class KimiDeltaAttention(nnx.Module):
             A_log=self.A_log,
             dt_bias=self.dt_bias,
         )
+        # 有界 gate（Kimi-K3 类模型）：配置带 gate_lower_bound 时 KDA prefill 走 safe_gate 路径
+        self.attn.kda_gate_lower_bound = linear_config.get("gate_lower_bound")
 
     def __call__(
         self,
