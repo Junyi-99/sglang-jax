@@ -455,7 +455,7 @@ def test_chunk_kda_32k_varlen_lower_bound_matches_naive_recurrent_kda():
     """Bounded gate (Kimi-K3: lower_bound=-5) through the strip-GEMM intra path.
 
     Same 33-request varlen fixture as the softplus node, with raw_g widened so
-    the activated gate covers ~0, -2.5 and ~-5 — the range that distinguishes
+    the activated gate covers ~0, -2.5 and ~-5 -- the range that distinguishes
     the safe_gate fast path from the generic decay-tensor path.
     """
     seq_lens, optimized_final_state, reference_final_state = _run_full_32k_case(
