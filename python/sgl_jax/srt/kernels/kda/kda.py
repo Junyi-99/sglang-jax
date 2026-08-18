@@ -1680,10 +1680,10 @@ def _chunk_kda_fwd_o_gk_pl_kernel(
     # Compute inter-chunk output: o = scale * q * exp2(g) @ h.
     # Use g[0] (first position, largest cumsum) as reference to avoid overflow/underflow:
     #   exp2(g[t]) = exp2(g[t] - g[0]) * exp2(g[0])
-    # g[t] - g[0] <= 0 for all t (cumsum is monotonically decreasing), so exp2 is safe.
+    # g[t] - g[0] ≤ 0 for all t (cumsum is monotonically decreasing), so exp2 is safe.
     # Factor exp2(g[0]) into h to preserve the matmul structure.
     _exp_fn = exp2 if USE_EXP2 else exp
-    b_g_ref = b_g_f32[0:1, :]  # [1, K] -- reference point
+    b_g_ref = b_g_f32[0:1, :]  # [1, K] — reference point
     b_qg = b_q_f32 * _exp_fn(jnp.maximum(b_g_f32 - b_g_ref, -126.0))
     # Scale h rows: h_scaled[k, v] = h[k, v] * exp2(g_ref[k])
     b_h_scaled = b_h.astype(jnp.float32) * _exp_fn(jnp.maximum(b_g_ref[0], -126.0))[:, None]
@@ -1744,7 +1744,7 @@ def chunk_kda_fwd_o_gk(
     seq_id = jnp.minimum(jnp.searchsorted(cum_chunks[1:], flat_idx, side="right"), N - 1)
     local_ci = flat_idx - cum_chunks[seq_id]
     bos = cu_i32[seq_id]
-    # After _align_seqs, every sequence is BT-aligned -- no partial chunks.
+    # After _align_seqs, every sequence is BT-aligned — no partial chunks.
     chunk_starts = jnp.where(is_valid, bos + local_ci * BT, 0)
 
     def gather(x_pad, D):
@@ -2342,6 +2342,8 @@ def chunk_kda_fwd(
     three bottleneck classes. All enabled is the shipped configuration; all
     disabled reproduces the original upstream four-stage kernel.
 
+    THE COMMENTS BELOW ONLY FOR REFERENCE, WHEN CODE IS MERGED, THE COMMENTS SHOULD BE REMOVED.
+
     Compute: ``safe_gate`` ports the FlashKDA compute path to TPU for models
     with bounded gates. When enabled, Aqk/L construction is decomposed exactly
     into per-sub-chunk strip GEMMs on the MXU, and a finite Neumann factor chain
@@ -2382,9 +2384,7 @@ def chunk_kda_fwd(
     assert not transpose_state_layout
     assert not return_intermediate_states
     assert not disable_recompute
-    assert (
-        fuse or not unified_layout
-    ), "unified_layout=True requires fuse=True (the 4-stage pipeline has its own per-stage glue)"
+    assert (fuse or not unified_layout), "unified_layout=True requires fuse=True"
     if safe_gate and use_gate_in_kernel and lower_bound is None:
         raise ValueError(
             "`lower_bound` must be specified when `safe_gate=True` and `use_gate_in_kernel=True`."
@@ -2415,7 +2415,9 @@ def chunk_kda_fwd(
 
     # Fix: _align_seqs pads g with 0, but softplus(0 + dt_bias) != 0 when
     # use_gate_in_kernel=True, producing non-zero gate activation at padding
-    # positions.  Set padding g to a large negative so the activated gate is ~0.
+    # positions.  This corrupts g_last (used for state propagation in Stage 3)
+    # and kg (used for state update).  Set padding g to a large negative so
+    # softplus(large_neg + dt_bias) ≈ 0, neutralising padding positions.
     if use_gate_in_kernel:
         orig_lens = _orig_cu_seqlens[1:] - _orig_cu_seqlens[:-1]
         aligned_starts = cu_seqlens[:-1]
