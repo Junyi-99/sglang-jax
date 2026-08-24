@@ -49,25 +49,8 @@ from variants import BASELINE, VARIANTS, resolve_variants, variant_kwargs
 
 from sgl_jax.srt.kernels.kda import chunk_kda, naive_recurrent_kda
 from sgl_jax.srt.kernels.utils.perf import multiple_iteration_timeit_from_trace
+from sgl_jax.srt.utils.common_utils import next_power_of_2
 from sgl_jax.srt.utils.jax_utils import get_device_name
-
-
-def next_power_of_2(x: int) -> int:
-    """Smallest power of two >= x. Same contract as srt.utils.common_utils'.
-
-    Deliberately not imported from there. srt/utils/__init__.py pulls the whole
-    serving stack (zmq, psutil, fastapi) on import, so a kernel benchmark run in
-    a bare JAX venv dies with ModuleNotFoundError before it measures anything --
-    which is exactly how this was found. Rounding up to a power of two has one
-    correct answer, so a local copy carries no risk of drifting from the
-    original; get_device_name stays imported because the device name is part of
-    the emitted table key and guessing it would be worse than failing.
-    """
-    assert x > 0
-    if x == 1:
-        return 1
-    return 1 << (x - 1).bit_length()
-
 
 # --------------------------------------------------------------------------
 # Default grids.
