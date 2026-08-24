@@ -293,7 +293,18 @@ def _bench_one_point(
             rows.append(
                 f"{num_seqs:4d} | {seq_len:8d} | {total_tokens:9d} | {chunk_size:3d} | "
                 f"{label:>10s} | {'FAILED':>11s} | {'-':>12s} | {'-':>9s} | "
-                f"{type(e).__name__}: {str(e)[:40]}"
+                f"{type(e).__name__}"
+            )
+            # The table column is too narrow to hold a compiler diagnostic, and
+            # truncating it loses exactly the part that matters -- whether a
+            # RESOURCE_EXHAUSTED is VMEM, SMEM or a scalar limit decides whether
+            # the configuration is tunable or simply out of reach. Print the
+            # whole message on its own line instead of clipping it.
+            first = " | ".join(str(e).split("\n")[:3])
+            print(
+                f"# [failed] N={num_seqs} T={seq_len} BT={chunk_size} {label}: "
+                f"{type(e).__name__}: {first[:600]}",
+                flush=True,
             )
             continue
         if name == BASELINE:
