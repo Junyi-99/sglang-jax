@@ -1,8 +1,10 @@
-"""Auto-tuner for the KDA chunk-size table.
+"""Auto-tuner for the KDA chunk-size table, anchored on stock sglang-jax.
 
-Sweeps candidate ``chunk_size`` (BT) values per shape, plus any boolean
-fast-path flags the installed ``chunk_kda`` happens to expose, and emits
-Python-literal entries keyed the same way the RPA v3 table is keyed.
+Sweeps candidate ``chunk_size`` (BT) values crossed with the named optimization
+variants from variants.py, and emits Python-literal entries keyed the same way
+the RPA v3 table is keyed. The reference point every delta is measured against
+is ``baseline`` -- the stock sglang-jax kernel at the production chunk size --
+so an emitted entry means "this much faster than upstream at this shape".
 
 Structure mirrors ``benchmark/kernels/flash_attention/get_block_spec_config_v3.py``:
 outer grid over shapes, inner enumeration of tunables, compare against the
@@ -35,7 +37,6 @@ from __future__ import annotations
 
 import argparse
 import functools
-import inspect
 import itertools
 import os
 from math import inf
@@ -44,6 +45,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from utils import activated_gate, create_kda_uniform_data
+from variants import BASELINE, VARIANTS, resolve_variants, variant_kwargs
 
 from sgl_jax.srt.kernels.kda import chunk_kda, naive_recurrent_kda
 from sgl_jax.srt.kernels.utils.perf import multiple_iteration_timeit_from_trace
@@ -78,29 +80,20 @@ _PROBE_NUM_SEQS = 2
 _PROBE_SEQ_LEN = 1024
 
 
-def _optional_bool_flags() -> list[str]:
-    """Boolean fast-path kwargs the installed ``chunk_kda`` exposes.
-
-    Upstream ``chunk_kda_fwd`` takes only chunk_size; local optimization
-    branches add flags like fuse / unified_layout / flat_grid / head_block.
-    Discovering them keeps one tuner working against both without pinning a
-    branch-specific signature.
-    """
-    known = ("fuse", "unified_layout", "flat_grid", "head_block")
-    try:
-        params = inspect.signature(chunk_kda).parameters
-    except (TypeError, ValueError):
-        return []
-    return [name for name in known if name in params and isinstance(params[name].default, bool)]
-
-
 def _enumerate_candidates(
     chunk_sizes: list[int],
     seq_len: int,
     num_heads: int,
-    flags: list[str],
+    variants: list[str],
 ) -> list[dict]:
-    """Cartesian product of chunk_size x boolean flags, with shape prunes."""
+    """chunk_size x named variant, with shape prunes.
+
+    Deliberately not a blind product over the boolean flags: several of their
+    2^N combinations are invalid (kda.py asserts ``fuse or not unified_layout``)
+    or silently fall back, which would spend TPU time measuring the same
+    configuration twice under different names. variants.py enumerates the
+    combinations that mean something.
+    """
     out = []
     for bt in chunk_sizes:
         if bt & (bt - 1):
@@ -109,26 +102,24 @@ def _enumerate_candidates(
             # BT above the sequence length degenerates to a single padded chunk:
             # the measurement would be all padding, not the shape asked for.
             continue
-        for combo in itertools.product((True, False), repeat=len(flags)):
-            cand = {"chunk_size": bt}
-            cand.update(dict(zip(flags, combo)))
+        for name in variants:
+            kw = variant_kwargs(name, chunk_kda)
             # head_block needs a TPU-shaped head tile; asking for it otherwise
             # silently falls back, producing a duplicate measurement.
-            if cand.get("head_block") and num_heads % 8 != 0:
+            if kw.get("head_block") and num_heads % 8 != 0:
                 continue
-            out.append(cand)
-    # Deduplicate while preserving order (flag prunes can collapse combos).
-    seen, uniq = set(), []
-    for cand in out:
-        key = tuple(sorted(cand.items()))
-        if key not in seen:
-            seen.add(key)
-            uniq.append(cand)
-    return uniq
+            out.append({"chunk_size": bt, "_variant": name, **kw})
+    return out
 
 
 def _cand_str(cand: dict) -> str:
-    return "-".join(f"{k}_{v}" for k, v in sorted(cand.items()))
+    name = cand.get("_variant", "?")
+    return f"{name}-bt{cand['chunk_size']}"
+
+
+def _call_kwargs(cand: dict) -> dict:
+    """Drop the bookkeeping key before handing the candidate to the kernel."""
+    return {k: v for k, v in cand.items() if not k.startswith("_")}
 
 
 # Tensor argument order for the jitted kernel. Passing tensors as real
@@ -170,7 +161,6 @@ def _kda_kernel(
         use_gate_in_kernel=True,
         A_log=A_log,
         dt_bias=dt_bias,
-        safe_gate=lower_bound is not None,
         lower_bound=lower_bound,
         **cand,
     )
@@ -178,7 +168,9 @@ def _kda_kernel(
 
 def _jitted_kernel(scale: float, lower_bound: float | None, cand: dict):
     """jit the kernel with tunables bound as static Python values."""
-    return jax.jit(functools.partial(_kda_kernel, scale=scale, lower_bound=lower_bound, **cand))
+    return jax.jit(
+        functools.partial(_kda_kernel, scale=scale, lower_bound=lower_bound, **_call_kwargs(cand))
+    )
 
 
 def _oracle(data: dict, seq_lens: list[int], scale: float, lower_bound: float | None):
@@ -286,15 +278,23 @@ def sweep(
     head_dim: int,
     lower_bound: float | None,
     chunk_sizes: list[int],
-    flags: list[str],
+    variants: list[str],
     tries: int,
     max_abs_err: float,
     seed: int,
 ):
-    """Returns (best_cand, best_ms, heuristic_cand, heuristic_ms)."""
-    candidates = _enumerate_candidates(chunk_sizes, seq_len, num_heads, flags)
-    heuristic = {"chunk_size": _HEURISTIC_CHUNK_SIZE}
-    heuristic.update({f: inspect.signature(chunk_kda).parameters[f].default for f in flags})
+    """Returns (best_cand, best_ms, baseline_cand, baseline_ms).
+
+    The reference point is the stock sglang-jax kernel at the production chunk
+    size, so the emitted delta answers "how much does our optimization buy at
+    this shape" rather than comparing two of our own configurations.
+    """
+    candidates = _enumerate_candidates(chunk_sizes, seq_len, num_heads, variants)
+    heuristic = {
+        "chunk_size": _HEURISTIC_CHUNK_SIZE,
+        "_variant": BASELINE,
+        **variant_kwargs(BASELINE, chunk_kda),
+    }
     if heuristic not in candidates:
         candidates = [heuristic] + candidates
 
@@ -388,6 +388,17 @@ def main():
     parser.add_argument("--num-seqs", default="", help="comma list; empty = full default grid")
     parser.add_argument("--seq-lens", default="", help="comma list; empty = full default grid")
     parser.add_argument("--chunk-sizes", default="", help="comma list; empty = full default grid")
+    parser.add_argument(
+        "--variants",
+        default="baseline,safe_gate,structural",
+        help="comma list of optimization variants; 'baseline' is stock sglang-jax",
+    )
+    parser.add_argument(
+        "--max-total-tokens",
+        type=int,
+        default=32768,
+        help="skip shapes whose num_seqs*seq_len exceeds this (HBM + realism guard)",
+    )
     parser.add_argument("--tries", type=int, default=1)
     parser.add_argument(
         "--lower-bound",
@@ -424,14 +435,30 @@ def main():
     num_seqs_list = _csv_ints(args.num_seqs) if args.num_seqs else list(_DEFAULT_NUM_SEQS)
     seq_lens = _csv_ints(args.seq_lens) if args.seq_lens else list(_DEFAULT_SEQ_LENS)
     chunk_sizes = _csv_ints(args.chunk_sizes) if args.chunk_sizes else list(_DEFAULT_CHUNK_SIZES)
-    flags = _optional_bool_flags()
+    requested = [v.strip() for v in args.variants.split(",") if v.strip()]
+    unknown = [v for v in requested if v not in VARIANTS]
+    if unknown:
+        raise SystemExit(f"unknown --variants {unknown}; choose from {sorted(VARIANTS)}")
+    variants, notes = resolve_variants(requested, chunk_kda)
+    for note in notes:
+        print(f"# [variants] {note}")
 
     device = get_device_name()
     shard_rank, shard_total = _parse_shard(args.shard)
 
-    outer = list(itertools.product(num_heads_list, head_dims, num_seqs_list, seq_lens))
+    full = list(itertools.product(num_heads_list, head_dims, num_seqs_list, seq_lens))
+    outer = [t for t in full if t[2] * t[3] <= args.max_total_tokens]
+    if len(outer) != len(full):
+        # Never drop silently: an unreported cap makes a partial sweep look complete.
+        print(
+            f"# [token-cap] skipping {len(full) - len(outer)}/{len(full)} shapes over "
+            f"--max-total-tokens={args.max_total_tokens}"
+        )
     my_work = outer[shard_rank::shard_total]
-    print(f"# device={device!r} tunable_flags={flags or '(chunk_size only)'}")
+    print(f"# device={device!r} variants={variants} chunk_sizes={chunk_sizes}")
+    print(
+        f"# reference point = {BASELINE!r} (stock sglang-jax) at chunk_size={_HEURISTIC_CHUNK_SIZE}"
+    )
     print(
         f"# outer-grid total={len(outer)} mine={len(my_work)} "
         f"(every {shard_total}-th starting at {shard_rank})"
@@ -447,7 +474,7 @@ def main():
                 head_dim,
                 lower_bound,
                 chunk_sizes,
-                flags,
+                variants,
                 args.tries,
                 args.max_abs_err,
                 args.seed,
@@ -477,7 +504,7 @@ def main():
     print()
     print(
         f"# --- Paste into TUNED_CHUNK_SIZES_KDA[{device!r}] "
-        f"(>={args.write_threshold_pct}% win only) ---"
+        f"(>={args.write_threshold_pct}% faster than stock sglang-jax only) ---"
     )
     for key, best, _, _, _, delta_pct in rows:
         if delta_pct >= args.write_threshold_pct:
