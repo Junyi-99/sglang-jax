@@ -15,6 +15,10 @@ three.
   structural  stage 2. Adds the restructured pipeline: fused h+o, unified
               layout, flat chunk grid, head blocking.
 
+An extra ``flat_grid`` point is registered but not in the default set: flat_grid
+is the one structural flag that also applies with fuse=False, so it can be
+attributed separately when the three-point run warrants it.
+
 ``safe_gate`` and ``lower_bound`` are independent knobs in ``chunk_kda``: the
 gate activation takes ``lower_bound`` regardless of ``safe_gate``. So the
 baseline can be given the same bounded gate as the other two while keeping the
@@ -28,9 +32,18 @@ import inspect
 
 __all__ = ["VARIANTS", "resolve_variants", "variant_kwargs"]
 
+# Every structural flag defaults to True in chunk_kda's signature, so a variant
+# has to switch them off explicitly to get the stock kernel. Two traps here,
+# both found by running against the real kernel rather than reading defaults:
+#   - kda.py asserts `fuse or not unified_layout`, so fuse=False alone raises.
+#   - flat_grid is honoured on the fuse=False path too (kda.py picks
+#     chunk_gated_delta_rule_fwd_h_flat vs ..._fwd_h by it), so leaving it True
+#     hands the baseline one of our optimizations and understates the speedup.
+_STOCK = {"fuse": False, "unified_layout": False, "flat_grid": False, "head_block": False}
+
 VARIANTS: dict[str, dict[str, bool]] = {
-    "baseline": {"safe_gate": False, "fuse": False},
-    "safe_gate": {"safe_gate": True, "fuse": False},
+    "baseline": {"safe_gate": False, **_STOCK},
+    "safe_gate": {"safe_gate": True, **_STOCK},
     "structural": {
         "safe_gate": True,
         "fuse": True,
@@ -39,6 +52,11 @@ VARIANTS: dict[str, dict[str, bool]] = {
         "head_block": True,
     },
 }
+
+# flat_grid is separable from the rest (it works with fuse=False), so a finer
+# four-point ablation is available if the three-point one shows structural
+# carrying most of the win and you want to know which part does the work.
+VARIANTS["flat_grid"] = {"safe_gate": True, **_STOCK, "flat_grid": True}
 
 BASELINE = "baseline"
 
