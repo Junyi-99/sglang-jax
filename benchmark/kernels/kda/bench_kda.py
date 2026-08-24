@@ -69,7 +69,7 @@ from sgl_jax.srt.kernels.kda import chunk_kda, naive_recurrent_kda
 # python/sglang/kernels/jit/benchmark/utils.py::get_benchmark_range.
 # --------------------------------------------------------------------------
 _FULL_BATCH_SIZES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
-_FULL_SEQ_LENS = (512, 1024, 2048, 4096, 8192)
+_FULL_SEQ_LENS = (512, 1024, 2048, 4096, 8192, 16384)
 _FULL_CHUNK_SIZES = (64,)
 
 _CI_BATCH_SIZES = (2,)
@@ -85,17 +85,26 @@ _DEFAULT_NUM_HEADS = 8
 _DEFAULT_HEAD_DIM = 128
 _DEFAULT_LOWER_BOUND = -5.0
 
-# Cap on tokens per kernel invocation. The grid axes are independent, so their
-# product reaches num_seqs * seq_len = 256 * 8192 = 2M tokens -- which neither
-# fits nor means anything:
-#   - memory: q/k/v/raw_g are [1, T_total, H, K] bf16, i.e. ~8KB/token at
-#     H=8/K=128, so 2M tokens is ~17GB of inputs alone before the per-chunk
-#     states ([T_total/BT, H, K, V] fp32), against 32GB of HBM on one v6e chip.
-#   - realism: chunk_kda is the chunked-prefill path. One real step carries at
-#     most chunked_prefill_size tokens (4096 in this repo, 8192 in the tuned
-#     tables) -- never a quarter-million.
-# Points above the cap are skipped and reported, never silently dropped.
-_DEFAULT_MAX_TOTAL_TOKENS = 32768
+# Cap on tokens per kernel invocation, as an HBM guard only.
+#
+# The axes are independent, so their product reaches num_seqs * seq_len =
+# 256 * 16384 = 4.2M tokens, which does not fit. Working set per token at
+# H=8, K=V=128, BT=64:
+#     inputs (q,k,v,raw_g, bf16)        8 KB
+#     output o                          2 KB
+#     per-chunk state h (fp32, ~1/BT)   8 KB
+#     stage intermediates              ~8 KB
+#                                    ~ 26 KB/token
+# so ~20 GB of usable HBM on one v6e chip is roughly 800K tokens per step. The
+# default leaves headroom below that; raise it with --max-total-tokens and the
+# kernel itself will report what does not fit.
+#
+# This is deliberately NOT a judgement about which shapes are realistic. Total
+# tokens in one extend step is num_seqs x seq_len, and a batch of long requests
+# legitimately produces a large product; earlier versions of this file capped at
+# 32768 on a chunked-prefill argument, which cut the sweep 25x below what the
+# hardware allows. Points above the cap are listed, never silently dropped.
+_DEFAULT_MAX_TOTAL_TOKENS = 524288
 
 
 def is_in_ci() -> bool:
@@ -504,8 +513,8 @@ def main():
         type=int,
         default=_DEFAULT_MAX_TOTAL_TOKENS,
         help=(
-            "skip any (num_seqs, seq_len) point whose product exceeds this; "
-            "guards both HBM and workload realism"
+            "skip any (num_seqs, seq_len) point whose product exceeds this "
+            "(HBM guard; ~26KB/token at H=8, K=V=128, BT=64)"
         ),
     )
     parser.add_argument("--seed", type=int, default=42)

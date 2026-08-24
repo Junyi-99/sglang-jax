@@ -57,20 +57,24 @@ def create_kda_uniform_data(
     H, K, V = num_heads, head_dim_k, head_dim_v
 
     def _unit_rows(shape):
-        x = rng.standard_normal(shape)
+        # float32, not the default float64: these tensors end up bf16, and at the
+        # token counts this sweep reaches (N x seq_len, hundreds of thousands) a
+        # float64 staging copy is four times the size of the array being built --
+        # gigabytes of host memory that are immediately thrown away.
+        x = rng.standard_normal(shape, dtype=np.float32)
         return x / np.sqrt((x * x).sum(-1, keepdims=True) + 1e-6)
 
     q = jnp.asarray(_unit_rows((1, total_tokens, H, K)), dtype=dtype)
     k = jnp.asarray(_unit_rows((1, total_tokens, H, K)), dtype=dtype)
-    v = jnp.asarray(rng.standard_normal((1, total_tokens, H, V)), dtype=dtype)
+    v = jnp.asarray(rng.standard_normal((1, total_tokens, H, V), dtype=np.float32), dtype=dtype)
 
-    raw_g = rng.standard_normal((1, total_tokens, H, K))
+    raw_g = rng.standard_normal((1, total_tokens, H, K), dtype=np.float32)
     if lower_bound is not None:
         raw_g = raw_g * gate_stress_scale()
     raw_g = jnp.asarray(raw_g, dtype=dtype)
 
     beta = jax.nn.sigmoid(
-        jnp.asarray(rng.standard_normal((1, total_tokens, H)), dtype=jnp.float32)
+        jnp.asarray(rng.standard_normal((1, total_tokens, H), dtype=np.float32))
     ).astype(dtype)
 
     A_log = jnp.asarray(-1.5 + 0.1 * rng.standard_normal((H,)), dtype=jnp.float32)

@@ -64,7 +64,7 @@ from sgl_jax.srt.utils.jax_utils import get_device_name
 _DEFAULT_NUM_HEADS = (8, 16, 32)
 _DEFAULT_HEAD_DIMS = (128,)
 _DEFAULT_NUM_SEQS = (1, 2, 4, 8, 16, 32, 64, 128, 256)
-_DEFAULT_SEQ_LENS = (512, 1024, 2048, 4096, 8192)
+_DEFAULT_SEQ_LENS = (512, 1024, 2048, 4096, 8192, 16384)
 
 # Tunable: chunk size. Powers of two only -- _align_seqs pads every sequence up
 # to a BT multiple, so a non-power-of-two BT wastes padding without buying
@@ -411,8 +411,8 @@ def main():
     parser.add_argument(
         "--max-total-tokens",
         type=int,
-        default=32768,
-        help="skip shapes whose num_seqs*seq_len exceeds this (HBM + realism guard)",
+        default=524288,
+        help="skip shapes whose num_seqs*seq_len exceeds this (HBM guard, ~26KB/token)",
     )
     parser.add_argument("--tries", type=int, default=1)
     parser.add_argument(
