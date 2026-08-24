@@ -272,11 +272,18 @@ def _bench_one_point(
 
     rows, base_lat = [], None
     for name in variants:
+        vk = variant_kwargs(name, chunk_kda)
+        label = name
+        # head_block is gated on H % 8 == 0 inside kda.py and falls back
+        # silently; disable it explicitly and relabel so the row states what ran.
+        if vk.get("head_block") and num_heads % 8 != 0:
+            vk = {**vk, "head_block": False}
+            label = f"{name}-nohb"
         kw = dict(
             scale=scale,
             chunk_size=chunk_size,
             lower_bound=lower_bound,
-            **variant_kwargs(name, chunk_kda),
+            **vk,
         )
         try:
             lat_s, (out, state) = benchmark_kernel(
@@ -285,7 +292,7 @@ def _bench_one_point(
         except Exception as e:  # noqa: BLE001
             rows.append(
                 f"{num_seqs:4d} | {seq_len:8d} | {total_tokens:9d} | {chunk_size:3d} | "
-                f"{name:>10s} | {'FAILED':>11s} | {'-':>12s} | {'-':>9s} | "
+                f"{label:>10s} | {'FAILED':>11s} | {'-':>12s} | {'-':>9s} | "
                 f"{type(e).__name__}: {str(e)[:40]}"
             )
             continue
@@ -298,7 +305,7 @@ def _bench_one_point(
             diff = f"{_max_abs_diff(out, ref[0]):.1e}/{_max_abs_diff(state, ref[1]):.1e}"
         rows.append(
             f"{num_seqs:4d} | {seq_len:8d} | {total_tokens:9d} | {chunk_size:3d} | "
-            f"{name:>10s} | {lat_s * 1e3:11.3f} | {total_tokens / lat_s:12.0f} | "
+            f"{label:>10s} | {lat_s * 1e3:11.3f} | {total_tokens / lat_s:12.0f} | "
             f"{speedup:>9s} | {diff:>19s}"
         )
     return rows
