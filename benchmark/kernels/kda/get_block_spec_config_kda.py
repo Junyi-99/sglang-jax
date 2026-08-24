@@ -310,11 +310,17 @@ def sweep(
         try:
             out_err, state_err = check_accuracy(cand, num_heads, head_dim, lower_bound, seed)
         except Exception as e:  # noqa: BLE001
-            if cand == heuristic:
-                print(
-                    f"# heuristic-candidate ACCURACY FAILURE n={num_seqs} t={seq_len} "
-                    f"h={num_heads} hd={head_dim}: {type(e).__name__}: {e}"
-                )
+            # Report every candidate that cannot even be accuracy-checked, not
+            # just the baseline. Swallowing these silently means a candidate can
+            # disappear from the sweep with no trace, and the run still looks
+            # like it covered the whole grid.
+            tag = "heuristic-candidate " if cand == heuristic else ""
+            print(
+                f"# [acc-error] {tag}n={num_seqs} t={seq_len} h={num_heads} "
+                f"hd={head_dim} {_cand_str(cand)}: {type(e).__name__}: "
+                f"{' | '.join(str(e).split(chr(10))[:2])[:400]}",
+                flush=True,
+            )
             continue
         if max(out_err, state_err) > max_abs_err:
             print(
@@ -330,11 +336,15 @@ def sweep(
         except Exception as e:  # noqa: BLE001
             # The heuristic candidate is the production baseline; if even it
             # raises, the workload itself is broken and the sweep is meaningless.
-            if cand == heuristic:
-                print(
-                    f"# heuristic-candidate FAILURE n={num_seqs} t={seq_len} h={num_heads} "
-                    f"hd={head_dim}: {type(e).__name__}: {e}"
-                )
+            # Non-heuristic failures still get reported -- a candidate dropping
+            # out is information about the shape, not noise to hide.
+            tag = "heuristic-candidate " if cand == heuristic else ""
+            print(
+                f"# [bench-error] {tag}n={num_seqs} t={seq_len} h={num_heads} "
+                f"hd={head_dim} {_cand_str(cand)}: {type(e).__name__}: "
+                f"{' | '.join(str(e).split(chr(10))[:2])[:400]}",
+                flush=True,
+            )
             continue
         if cand == heuristic:
             heuristic_time = t
@@ -513,7 +523,11 @@ def main():
     )
     for key, best, _, _, _, delta_pct in rows:
         if delta_pct >= args.write_threshold_pct:
-            print(f"    {key}: {best},")
+            # Strip the bookkeeping key: these lines are meant to be pasted into
+            # a table and handed straight to chunk_kda, which would reject
+            # '_variant' as an unexpected keyword. Name the variant in a comment
+            # instead so the provenance is not lost.
+            print(f"    {key}: {_call_kwargs(best)},  # {best.get('_variant')}")
     print()
     print("# --- All measured (for audit) ---")
     for key, best, best_t, heur, heur_t, delta_pct in rows:
