@@ -104,11 +104,16 @@ def _enumerate_candidates(
             continue
         for name in variants:
             kw = variant_kwargs(name, chunk_kda)
-            # head_block needs a TPU-shaped head tile; asking for it otherwise
-            # silently falls back, producing a duplicate measurement.
+            label = name
+            # head_block needs a head count divisible by 8 (kda.py gates it on
+            # H % 8 == 0 and falls back silently otherwise). Turn it off rather
+            # than dropping the variant: the rest of the structural pipeline
+            # (fuse / unified_layout / flat_grid) is still worth measuring, and
+            # relabelling keeps the row honest about what actually ran.
             if kw.get("head_block") and num_heads % 8 != 0:
-                continue
-            out.append({"chunk_size": bt, "_variant": name, **kw})
+                kw = {**kw, "head_block": False}
+                label = f"{name}-nohb"
+            out.append({"chunk_size": bt, "_variant": label, **kw})
     return out
 
 
