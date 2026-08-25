@@ -371,7 +371,7 @@ def run_sweep(
         f"KDA Ablation [{title}] "
         f"(H={num_heads}, K=V={head_dim}, "
         f"gate={'bounded lb=' + str(lower_bound) if lower_bound is not None else 'softplus'}, "
-        f"baseline={BASELINE!r} = baseline (unmodified sglang-jax))"
+        f"reference = {BASELINE!r} (unmodified sglang-jax))"
     )
     print("=" * _RULE_WIDTH)
     print(_HEADER)
