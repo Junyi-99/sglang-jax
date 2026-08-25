@@ -6,7 +6,7 @@ delta rule -- and differ only in which optimization is switched on. That is
 what makes their latencies comparable and lets one fp32 oracle validate all
 three.
 
-  baseline    the stock sglang-jax kernel: ``fuse=False`` selects the branch
+  baseline    the unmodified sglang-jax kernel: ``fuse=False`` selects the branch
               whose own comment reads "Original upstream four-stage pipeline
               used as the ablation baseline" (kda.py), with the bounded-gate
               fast path off.
@@ -33,7 +33,7 @@ import inspect
 __all__ = ["VARIANTS", "resolve_variants", "variant_kwargs"]
 
 # Every structural flag defaults to True in chunk_kda's signature, so a variant
-# has to switch them off explicitly to get the stock kernel. Two traps here,
+# has to switch them off explicitly to get the baseline kernel. Two traps here,
 # both found by running against the real kernel rather than reading defaults:
 #   - kda.py asserts `fuse or not unified_layout`, so fuse=False alone raises.
 #   - flat_grid is honoured on the fuse=False path too (kda.py picks

@@ -1,10 +1,10 @@
 """Benchmark the KDA kernel over a (B, S) sweep, as a three-point ablation.
 
-Baseline is the stock sglang-jax kernel. Against it we measure the two stages
+Baseline is the unmodified sglang-jax kernel. Against it we measure the two stages
 of our optimization, all three running identical math (same bounded gate, same
 delta rule) so the latencies are directly comparable:
 
-  baseline    stock sglang-jax: the upstream four-stage pipeline (fuse=False),
+  baseline    baseline (unmodified sglang-jax): the upstream four-stage pipeline (fuse=False),
               bounded-gate fast path off
   safe_gate   stage 1: strip-GEMM path for Aqk/L (safe_gate=True)
   structural  stage 2: + fused h+o, unified layout, flat grid, head blocking
@@ -371,7 +371,7 @@ def run_sweep(
         f"KDA Ablation [{title}] "
         f"(H={num_heads}, K=V={head_dim}, "
         f"gate={'bounded lb=' + str(lower_bound) if lower_bound is not None else 'softplus'}, "
-        f"baseline={BASELINE!r} = stock sglang-jax)"
+        f"baseline={BASELINE!r} = baseline (unmodified sglang-jax))"
     )
     print("=" * _RULE_WIDTH)
     print(_HEADER)
@@ -505,7 +505,7 @@ def main():
         default="baseline,safe_gate,structural",
         help=(
             "comma list of optimization variants to compare; "
-            "'baseline' is stock sglang-jax and anchors the speedup column"
+            "'baseline' is baseline (unmodified sglang-jax) and anchors the speedup column"
         ),
     )
     parser.add_argument(

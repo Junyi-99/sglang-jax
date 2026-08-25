@@ -1,9 +1,9 @@
-"""Auto-tuner for the KDA chunk-size table, anchored on stock sglang-jax.
+"""Auto-tuner for the KDA chunk-size table, anchored on baseline (unmodified sglang-jax).
 
 Sweeps candidate ``chunk_size`` (BT) values crossed with the named optimization
 variants from variants.py, and emits Python-literal entries keyed the same way
 the RPA v3 table is keyed. The reference point every delta is measured against
-is ``baseline`` -- the stock sglang-jax kernel at the production chunk size --
+is ``baseline`` -- the unmodified sglang-jax kernel at the production chunk size --
 so an emitted entry means "this much faster than upstream at this shape".
 
 Structure mirrors ``benchmark/kernels/flash_attention/get_block_spec_config_v3.py``:
@@ -290,7 +290,7 @@ def sweep(
 ):
     """Returns (best_cand, best_ms, baseline_cand, baseline_ms).
 
-    The reference point is the stock sglang-jax kernel at the production chunk
+    The reference point is the unmodified sglang-jax kernel at the production chunk
     size, so the emitted delta answers "how much does our optimization buy at
     this shape" rather than comparing two of our own configurations.
     """
@@ -406,7 +406,7 @@ def main():
     parser.add_argument(
         "--variants",
         default="baseline,safe_gate,structural",
-        help="comma list of optimization variants; 'baseline' is stock sglang-jax",
+        help="comma list of optimization variants; 'baseline' is baseline (unmodified sglang-jax)",
     )
     parser.add_argument(
         "--max-total-tokens",
@@ -472,7 +472,7 @@ def main():
     my_work = outer[shard_rank::shard_total]
     print(f"# device={device!r} variants={variants} chunk_sizes={chunk_sizes}")
     print(
-        f"# reference point = {BASELINE!r} (stock sglang-jax) at chunk_size={_HEURISTIC_CHUNK_SIZE}"
+        f"# reference point = {BASELINE!r} (baseline (unmodified sglang-jax)) at chunk_size={_HEURISTIC_CHUNK_SIZE}"
     )
     print(
         f"# outer-grid total={len(outer)} mine={len(my_work)} "
@@ -519,7 +519,7 @@ def main():
     print()
     print(
         f"# --- Paste into TUNED_CHUNK_SIZES_KDA[{device!r}] "
-        f"(>={args.write_threshold_pct}% faster than stock sglang-jax only) ---"
+        f"(>={args.write_threshold_pct}% faster than baseline (unmodified sglang-jax) only) ---"
     )
     for key, best, _, _, _, delta_pct in rows:
         if delta_pct >= args.write_threshold_pct:
