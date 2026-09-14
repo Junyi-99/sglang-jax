@@ -180,7 +180,7 @@ def load_trace(root: str) -> dict:
     for tf in sorted(latest.glob("*.trace.json.gz")):
         with gzip.open(tf, "rb") as fh:
             out["traceEvents"].extend(json.load(fh).get("traceEvents", []))
-    return out
+    return out, n_lanes
 
 
 def scope_mix(trace: dict, iters: int) -> dict:
@@ -232,6 +232,7 @@ def scope_mix(trace: dict, iters: int) -> dict:
             if stack:
                 stack[-1][3] += done[1] - done[0]
 
+    n_lanes = max(len(per_lane), 1)
     out = {}
     for n in incl:
         v = sorted(durs[n])
@@ -239,6 +240,8 @@ def scope_mix(trace: dict, iters: int) -> dict:
             "regions": cnt[n],
             "inclusive_us_per_iter": incl[n] / iters,
             "self_us_per_iter": excl[n] / iters,
+            # summed across trace lanes; divide by _lanes for a wall-clock-comparable figure
+            "self_us_per_iter_per_lane": excl[n] / iters / n_lanes,
             "per_region_us": {
                 "mean": incl[n] / max(cnt[n], 1),
                 "p50": v[len(v) // 2],
@@ -293,8 +296,14 @@ def run_one(label, E, K, H, F, T, mesh, ep_size, bt_override, bts, bf_override):
     log(f"{label} T={T} H={H} F={F} ep={ep_size} block={bc} ({src_desc}) "
         f"tok/expert={tokens_per_expert:.0f} num_bts_tiles={n_bts_tiles}")
 
+    # jit it: called eagerly, the wall clock measures Python dispatch rather than
+    # the kernel, and comes out roughly constant across block configs.
+    _jitted = jax.jit(
+        lambda t, a, b, c, w, i: fused_ep_moe_v2(mesh, t, a, b, c, w, i, K, block_config=bc)
+    )
+
     def run():
-        return fused_ep_moe_v2(mesh, tokens, w1, w2, w3, wts, ids, K, block_config=bc)
+        return _jitted(tokens, w1, w2, w3, wts, ids)
 
     out = jax.block_until_ready(run())
     for _ in range(3):
@@ -331,7 +340,7 @@ def run_one(label, E, K, H, F, T, mesh, ep_size, bt_override, bts, bf_override):
     with trace_cm:
         for _ in range(iters):
             jax.block_until_ready(run())
-    mix = scope_mix(load_trace(root), iters)
+    mix, n_lanes = scope_mix(load_trace(root), iters)
 
     acc_bt = min(bc.bt, 16)
     packing = 2                      # bf16
@@ -347,7 +356,7 @@ def run_one(label, E, K, H, F, T, mesh, ep_size, bt_override, bts, bf_override):
            "ideal_valu_per_iter": round(ideal_valu, 1),
            "observed_valu_per_iter": (obs / iters) if obs else None,
            "valu_ratio": round((obs / iters) / ideal_valu, 2) if obs and ideal_valu else None,
-           "scopes": mix, "output_absmax": float(np.abs(np.asarray(jax.device_get(out), np.float32)).max())}
+           "trace_lanes": n_lanes, "scopes": mix, "output_absmax": float(np.abs(np.asarray(jax.device_get(out), np.float32)).max())}
     log(json.dumps({k: rec[k] for k in ("label", "tokens", "ideal_valu_per_iter",
                                         "observed_valu_per_iter", "valu_ratio")}))
     gcs_write(f"shards/{tag}/result.json", rec)
