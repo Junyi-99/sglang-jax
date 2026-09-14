@@ -180,7 +180,7 @@ def load_trace(root: str) -> dict:
     for tf in sorted(latest.glob("*.trace.json.gz")):
         with gzip.open(tf, "rb") as fh:
             out["traceEvents"].extend(json.load(fh).get("traceEvents", []))
-    return out, n_lanes
+    return out
 
 
 def scope_mix(trace: dict, iters: int) -> dict:
@@ -249,7 +249,7 @@ def scope_mix(trace: dict, iters: int) -> dict:
                 "max": v[-1],
             },
         }
-    return out
+    return out, n_lanes
 
 
 def run_one(label, E, K, H, F, T, mesh, ep_size, bt_override, bts, bf_override):
