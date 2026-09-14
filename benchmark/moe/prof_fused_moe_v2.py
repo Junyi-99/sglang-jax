@@ -30,6 +30,116 @@ import subprocess
 import sys
 import time
 
+def load_trace(root: str) -> dict:
+    d = pathlib.Path(root) / "plugins" / "profile"
+    latest = max(d.iterdir(), key=os.path.getmtime)
+    out: dict = {"traceEvents": []}
+    for tf in sorted(latest.glob("*.trace.json.gz")):
+        with gzip.open(tf, "rb") as fh:
+            out["traceEvents"].extend(json.load(fh).get("traceEvents", []))
+    return out
+
+
+def scope_mix(trace: dict, iters: int) -> dict:
+    """Exclusive self-time per scope.
+
+    Summing window durations double-counts: the scopes nest (expert_ffn contains
+    the ffn/weight-wait scopes, which contain others). Build the containment
+    forest per trace lane and subtract each window's direct children, so the
+    self times are additive.
+
+    Also keeps the per-region distribution for the *_load_wait scopes: a large
+    total made of many cheap waits is a scheduling artefact, one made of a few
+    long waits is a real stall.
+    """
+    ev = trace["traceEvents"]
+    tname = {(e["pid"], e["tid"]): e.get("args", {}).get("name")
+             for e in ev if e.get("ph") == "M" and e.get("name") == "thread_name" and "tid" in e}
+    per_lane = collections.defaultdict(list)
+    for e in ev:
+        if e.get("ph") != "X":
+            continue
+        if tname.get((e.get("pid"), e.get("tid"))) != "XLA TraceMe":
+            continue
+        n = (e.get("name") or "").split("/")[-1]
+        d = e.get("dur", 0)
+        if n and d >= 0:
+            per_lane[(e["pid"], e["tid"])].append((e["ts"], e["ts"] + d, n))
+
+    incl = collections.Counter()
+    excl = collections.Counter()
+    cnt = collections.Counter()
+    durs = collections.defaultdict(list)
+    for wins in per_lane.values():
+        wins.sort(key=lambda w: (w[0], -(w[1] - w[0])))
+        stack: list[list] = []          # [start, end, name, child_time]
+        for st, en, n in wins:
+            while stack and stack[-1][1] <= st:
+                done = stack.pop()
+                excl[done[2]] += (done[1] - done[0]) - done[3]
+                if stack:
+                    stack[-1][3] += done[1] - done[0]
+            incl[n] += en - st
+            cnt[n] += 1
+            durs[n].append(en - st)
+            stack.append([st, en, n, 0.0])
+        while stack:
+            done = stack.pop()
+            excl[done[2]] += (done[1] - done[0]) - done[3]
+            if stack:
+                stack[-1][3] += done[1] - done[0]
+
+    n_lanes = max(len(per_lane), 1)
+    out = {}
+    for n in incl:
+        v = sorted(durs[n])
+        out[n] = {
+            "regions": cnt[n],
+            "inclusive_us_per_iter": incl[n] / iters,
+            "self_us_per_iter": excl[n] / iters,
+            # summed across trace lanes; divide by _lanes for a wall-clock-comparable figure
+            "self_us_per_iter_per_lane": excl[n] / iters / n_lanes,
+            "per_region_us": {
+                "mean": incl[n] / max(cnt[n], 1),
+                "p50": v[len(v) // 2],
+                "p90": v[int(len(v) * 0.9)],
+                "max": v[-1],
+            },
+        }
+    return out, n_lanes
+
+
+def _selfcheck():
+    """Nesting arithmetic + the return arity that broke twice. `python prof_fused_moe_v2.py --selfcheck`."""
+    def ev(pid, tid, name, ts, dur):
+        return {"ph": "X", "pid": pid, "tid": tid, "name": name, "ts": ts, "dur": dur}
+    meta = lambda pid, tid: {"ph": "M", "name": "thread_name", "pid": pid, "tid": tid,
+                             "args": {"name": "XLA TraceMe"}}
+    trace = {"traceEvents": [
+        meta(0, 1), meta(0, 2),
+        # lane 1: outer[0,100) contains a[10,40) and b[50,70)  -> outer self = 100-30-20 = 50
+        ev(0, 1, "outer", 0, 100), ev(0, 1, "a", 10, 30), ev(0, 1, "b", 50, 20),
+        # lane 2: same shape again, so totals double and lane count is 2
+        ev(0, 2, "outer", 0, 100), ev(0, 2, "a", 10, 30), ev(0, 2, "b", 50, 20),
+    ]}
+    mix, lanes = scope_mix(trace, iters=2)
+    assert lanes == 2, lanes
+    assert mix["outer"]["self_us_per_iter"] == 50.0, mix["outer"]        # (50+50)/2 iters
+    assert mix["outer"]["inclusive_us_per_iter"] == 100.0, mix["outer"]  # (100+100)/2
+    assert mix["outer"]["self_us_per_iter_per_lane"] == 25.0, mix["outer"]
+    assert mix["a"]["self_us_per_iter"] == 30.0 and mix["a"]["regions"] == 2, mix["a"]
+    # self times are additive: they must sum to the wall span, not over-count
+    assert sum(v["self_us_per_iter"] for v in mix.values()) == 100.0, mix
+    print("selfcheck OK")
+
+
+# scope_mix is pure stdlib and has silently broken twice; keep it runnable
+# without a TPU, and check it before the backend is touched.
+if "--selfcheck" in sys.argv:
+    _selfcheck()
+    raise SystemExit(0)
+
+
 # LIBTPU_INIT_ARGS must be set before the backend initialises, and the accepted
 # flag names differ between libtpu builds. Probe in a subprocess and keep only
 # the set this runtime accepts, rather than failing the whole run on a name.
@@ -171,85 +281,6 @@ def gcs_exists(rel: str) -> bool:
     r = subprocess.run(["gcloud", "storage", "ls", f"{OUTPUT_URI}/{rel}"],
                        capture_output=True)
     return r.returncode == 0
-
-
-def load_trace(root: str) -> dict:
-    d = pathlib.Path(root) / "plugins" / "profile"
-    latest = max(d.iterdir(), key=os.path.getmtime)
-    out: dict = {"traceEvents": []}
-    for tf in sorted(latest.glob("*.trace.json.gz")):
-        with gzip.open(tf, "rb") as fh:
-            out["traceEvents"].extend(json.load(fh).get("traceEvents", []))
-    return out
-
-
-def scope_mix(trace: dict, iters: int) -> dict:
-    """Exclusive self-time per scope.
-
-    Summing window durations double-counts: the scopes nest (expert_ffn contains
-    the ffn/weight-wait scopes, which contain others). Build the containment
-    forest per trace lane and subtract each window's direct children, so the
-    self times are additive.
-
-    Also keeps the per-region distribution for the *_load_wait scopes: a large
-    total made of many cheap waits is a scheduling artefact, one made of a few
-    long waits is a real stall.
-    """
-    ev = trace["traceEvents"]
-    tname = {(e["pid"], e["tid"]): e.get("args", {}).get("name")
-             for e in ev if e.get("ph") == "M" and e.get("name") == "thread_name" and "tid" in e}
-    per_lane = collections.defaultdict(list)
-    for e in ev:
-        if e.get("ph") != "X":
-            continue
-        if tname.get((e.get("pid"), e.get("tid"))) != "XLA TraceMe":
-            continue
-        n = (e.get("name") or "").split("/")[-1]
-        d = e.get("dur", 0)
-        if n and d >= 0:
-            per_lane[(e["pid"], e["tid"])].append((e["ts"], e["ts"] + d, n))
-
-    incl = collections.Counter()
-    excl = collections.Counter()
-    cnt = collections.Counter()
-    durs = collections.defaultdict(list)
-    for wins in per_lane.values():
-        wins.sort(key=lambda w: (w[0], -(w[1] - w[0])))
-        stack: list[list] = []          # [start, end, name, child_time]
-        for st, en, n in wins:
-            while stack and stack[-1][1] <= st:
-                done = stack.pop()
-                excl[done[2]] += (done[1] - done[0]) - done[3]
-                if stack:
-                    stack[-1][3] += done[1] - done[0]
-            incl[n] += en - st
-            cnt[n] += 1
-            durs[n].append(en - st)
-            stack.append([st, en, n, 0.0])
-        while stack:
-            done = stack.pop()
-            excl[done[2]] += (done[1] - done[0]) - done[3]
-            if stack:
-                stack[-1][3] += done[1] - done[0]
-
-    n_lanes = max(len(per_lane), 1)
-    out = {}
-    for n in incl:
-        v = sorted(durs[n])
-        out[n] = {
-            "regions": cnt[n],
-            "inclusive_us_per_iter": incl[n] / iters,
-            "self_us_per_iter": excl[n] / iters,
-            # summed across trace lanes; divide by _lanes for a wall-clock-comparable figure
-            "self_us_per_iter_per_lane": excl[n] / iters / n_lanes,
-            "per_region_us": {
-                "mean": incl[n] / max(cnt[n], 1),
-                "p50": v[len(v) // 2],
-                "p90": v[int(len(v) * 0.9)],
-                "max": v[-1],
-            },
-        }
-    return out, n_lanes
 
 
 def run_one(label, E, K, H, F, T, mesh, ep_size, bt_override, bts, bf_override):
@@ -408,3 +439,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
