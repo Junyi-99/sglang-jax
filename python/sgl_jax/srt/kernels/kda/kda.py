@@ -350,6 +350,25 @@ def _solve_unit_lower_triangular(A, b):
     return jnp.concatenate(blocks, axis=0)
 
 
+def _neumann_fused_wide(L, z, BT):
+    # K3-branch solve: L is strictly lower triangular => nilpotent (L^BT = 0),
+    # so (I+L)^-1 equals the finite factorization (I-L)(I+L^2)...(I+L^{BT/2})
+    # exactly. Propagate Z = [I | v_beta | k_eg_beta] through the factors
+    # (they are polynomials in L and commute): log2(BT)-1 power dots plus
+    # log2(BT) wide [BT,BT]@[BT,BT+V+K] dots that fill the MXU lane width.
+    # Runs in one bf16 MXU pass: applying factors to the RHS never
+    # materializes the explicit inverse, whose compounding rounding error is
+    # what makes the DIRECT bf16 form fail the 5e-4 oracle gate (measured:
+    # direct 6.9e-04 FAIL, fused 2.77e-04 OK). Do not "simplify" this into
+    # inverse-then-multiply.
+    z = z - jax.lax.dot(L, z, preferred_element_type=jnp.float32)
+    Lp = L
+    for _ in range(int(math.log2(BT)) - 1):
+        Lp = jax.lax.dot(Lp, Lp, preferred_element_type=jnp.float32)
+        z = z + jax.lax.dot(Lp, z, preferred_element_type=jnp.float32)
+    return z
+
+
 def _kda_fwd_intra_kernel(
     q_ref,
     k_ref,
@@ -391,30 +410,77 @@ def _kda_fwd_intra_kernel(
     causal_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32))
     strict_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32), k=-1)
 
-    # g_diff[i, j, k] = g[i, k] - g[j, k];  shape [BT, BT, K]
-    g_diff = g_f32[:, None, :] - g_f32[None, :, :]
-    # Mask anti-causal entries to -126 before exp2 to prevent overflow;
-    # they will be zeroed by causal_bt / strict_bt anyway.
-    g_diff = jnp.where(causal_bt[:, :, None] > 0, g_diff, -126.0)
-    decay = exp2(jnp.maximum(g_diff, -126.0))  # [BT, BT, K]
+    if safe_gate:
+        # safe_gate path: Aqk/L become BT/16 per-sub-chunk GEMMs
+        # [BT,K]@[K,16] on the MXU instead of a [BT,BT,K] elementwise tensor
+        # on the VPU ([16,16,128]).
+        SB = 16
+        aqk_subchunks, l_subchunks = [], []
+        for blk in range(BT // SB):
+            cols = slice(blk * SB, (blk + 1) * SB)
+            r_b = g_f32[blk * SB + SB // 2 : blk * SB + SB // 2 + 1, :]  # [1, K]
+            row = exp2(g_f32 - r_b)  # [BT, K]
+            col = k_f32[cols] * exp2(r_b - g_f32[cols])  # [SB, K]
+            aqk_subchunks.append(
+                jax.lax.dot_general(
+                    q_f32 * row,
+                    col,
+                    (((1,), (1,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+            )
+            l_subchunks.append(
+                jax.lax.dot_general(
+                    k_f32 * row,
+                    col,
+                    (((1,), (1,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+            )
+        o_i = jnp.arange(BT, dtype=jnp.int32)
+        # Aqk[i, j] = scale * sum_k q[i,k] * k[j,k] * exp2(g[i,k] - g[j,k])
+        Aqk = jnp.where(
+            o_i[:, None] >= o_i[None, :], scale * jnp.concatenate(aqk_subchunks, axis=-1), 0.0
+        )
+        # L[i, j] = sum_k k[i,k] * k[j,k] * exp2(g[i,k] - g[j,k])   (i > j)
+        L = jnp.where(o_i[:, None] > o_i[None, :], jnp.concatenate(l_subchunks, axis=-1), 0.0)
+    else:
+        # g_diff[i, j, k] = g[i, k] - g[j, k];  shape [BT, BT, K]
+        g_diff = g_f32[:, None, :] - g_f32[None, :, :]
+        # Mask anti-causal entries to -126 before exp2 to prevent overflow;
+        # they will be zeroed by causal_bt / strict_bt anyway.
+        g_diff = jnp.where(causal_bt[:, :, None] > 0, g_diff, -126.0)
+        decay = exp2(jnp.maximum(g_diff, -126.0))  # [BT, BT, K]
 
-    # Aqk[i, j] = scale * sum_k q[i,k] * k[j,k] * decay[i,j,k]
-    Aqk = scale * jnp.sum(q_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1)
+        # Aqk[i, j] = scale * sum_k q[i,k] * k[j,k] * decay[i,j,k]
+        Aqk = scale * jnp.sum(q_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1)
+
+        # L[i, j] = beta[i] * sum_k k[i,k] * k[j,k] * decay[i,j,k]   (i > j)
+        L = jnp.sum(k_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1)
+
     Aqk = (Aqk * causal_bt).astype(dtype)
-
-    # L[i, j] = beta[i] * sum_k k[i,k] * k[j,k] * decay[i,j,k]   (i > j)
-    L = jnp.sum(k_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1) * beta_f32 * strict_bt
+    L = L * beta_f32 * strict_bt
 
     v_beta = v.astype(jnp.float32) * beta_f32
     k_eg_beta = k_f32 * exp2(g_f32) * beta_f32
     identity = jnp.eye(BT, dtype=jnp.float32)
 
-    combined_b = jnp.concatenate([v_beta, k_eg_beta, identity], axis=-1)
-    combined_x = _solve_unit_lower_triangular(L, combined_b)
+    if safe_gate:
+        # Kimi-K3 special branch (bounded gate, lower_bound validated in
+        # [-5, 0)): fused-wide finite Neumann, one bf16 MXU pass.
+        z = jnp.concatenate([identity, v_beta, k_eg_beta], axis=-1)
+        z = _neumann_fused_wide(L, z, BT)
+        A_inv = z[:, :BT]
+        u = z[:, BT : BT + value_dim]
+        w = z[:, BT + value_dim :]
+    else:
+        # General KDA: sequential forward substitution (upstream original).
+        combined_b = jnp.concatenate([v_beta, k_eg_beta, identity], axis=-1)
+        combined_x = _solve_unit_lower_triangular(L, combined_b)
 
-    u = combined_x[:, :value_dim]
-    w = combined_x[:, value_dim : value_dim + head_dim]
-    A_inv = combined_x[:, value_dim + head_dim :]
+        u = combined_x[:, :value_dim]
+        w = combined_x[:, value_dim : value_dim + head_dim]
+        A_inv = combined_x[:, value_dim + head_dim :]
 
     g_last = g_f32[BT - 1 : BT, :]
     kg = k_f32 * exp2(g_last - g_f32)
@@ -448,7 +514,7 @@ def kda_fwd_intra(
     cu_seqlens,
     chunk_size=64,
     chunk_indices=None,
-    safe_gate=True,
+    safe_gate=False,
     disable_recompute=False,
 ):
     assert cu_seqlens is not None, "cu_seqlens must be provided for varlen"
@@ -1153,7 +1219,7 @@ def chunk_kda_fwd(
     use_qk_l2norm_in_kernel: bool = False,
     chunk_indices: jax.Array | None = None,
     chunk_size: int = 64,
-    safe_gate: bool = True,
+    safe_gate: bool = False,
     lower_bound: float | None = None,
     use_gate_in_kernel: bool = False,
     A_log: jax.Array | None = None,
@@ -1183,6 +1249,16 @@ def chunk_kda_fwd(
     assert use_qk_l2norm_in_kernel is False
     assert cp_context is None
     assert not transpose_state_layout
+
+    # Mirrors fla.ops.kda.chunk_kda
+    if safe_gate and use_gate_in_kernel:
+        if lower_bound is None:
+            raise ValueError(
+                "`lower_bound` must be specified when `safe_gate=True` and "
+                "`use_gate_in_kernel=True`."
+            )
+        if not (-5.0 <= lower_bound < 0.0):
+            raise ValueError(f"`lower_bound` must be in the safe range [-5, 0), got {lower_bound}.")
     assert not return_intermediate_states
     assert not disable_recompute
 
@@ -1199,12 +1275,13 @@ def chunk_kda_fwd(
     # Varlen alignment
     _orig_cu_seqlens = cu_seqlens
     T_input = T
-    [q, k, v, g], [beta], cu_seqlens, _ = _align_seqs(
-        [q, k, v, g],
-        [beta],
-        cu_seqlens,
-        align=BT,
-    )
+    with jax.named_scope("kda_align"):
+        [q, k, v, g], [beta], cu_seqlens, _ = _align_seqs(
+            [q, k, v, g],
+            [beta],
+            cu_seqlens,
+            align=BT,
+        )
     T = q.shape[1]
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT, max_T=T)
 
@@ -1228,72 +1305,78 @@ def chunk_kda_fwd(
     # Step 1: Gate cumsum
     if use_gate_in_kernel:
         assert A_log is not None
-        g_cumsum = kda_gate_chunk_cumsum(
-            g=g,
-            A_log=A_log,
-            chunk_size=BT,
-            scale=_RCP_LN2,
-            dt_bias=dt_bias,
-            lower_bound=lower_bound,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-        )
+        with jax.named_scope("kda_gate_cumsum"):
+            g_cumsum = kda_gate_chunk_cumsum(
+                g=g,
+                A_log=A_log,
+                chunk_size=BT,
+                scale=_RCP_LN2,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+            )
     else:
-        g_cumsum = pallas_kda_gate_cumsum(
-            g=g,
-            scale=_RCP_LN2,
-            chunk_size=chunk_size,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-        )
+        with jax.named_scope("kda_gate_cumsum"):
+            g_cumsum = pallas_kda_gate_cumsum(
+                g=g,
+                scale=_RCP_LN2,
+                chunk_size=chunk_size,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+            )
 
     # Step 2: Intra-chunk solve
-    w, u, qg, kg, Aqk, Akk = kda_fwd_intra(
-        q=q,
-        k=k,
-        v=v,
-        gk=g_cumsum,
-        beta=beta,
-        scale=scale,
-        safe_gate=safe_gate,
-        chunk_size=BT,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
+    with jax.named_scope("kda_intra"):
+        w, u, qg, kg, Aqk, Akk = kda_fwd_intra(
+            q=q,
+            k=k,
+            v=v,
+            gk=g_cumsum,
+            beta=beta,
+            scale=scale,
+            safe_gate=safe_gate,
+            chunk_size=BT,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
 
     # Step 3: Inter-chunk state propagation
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
-        k=kg,
-        w=w,
-        u=u,
-        gk=g_cumsum,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        chunk_size=BT,
-        use_exp2=True,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
+    with jax.named_scope("kda_fwd_h"):
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+            k=kg,
+            w=w,
+            u=u,
+            gk=g_cumsum,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            chunk_size=BT,
+            use_exp2=True,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
 
     # Step 4: Output computation
-    o = chunk_kda_fwd_o_gk(
-        q=q,
-        v=v_new,
-        g=g_cumsum,
-        A=Aqk,
-        h=h,
-        scale=scale,
-        chunk_size=BT,
-        use_exp2=True,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
+    with jax.named_scope("kda_o_gk"):
+        o = chunk_kda_fwd_o_gk(
+            q=q,
+            v=v_new,
+            g=g_cumsum,
+            A=Aqk,
+            h=h,
+            scale=scale,
+            chunk_size=BT,
+            use_exp2=True,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
 
     # Cast output back to input dtype (e.g. bfloat16)
     o = o.astype(q.dtype)
 
     # Unalign output
-    o = _unalign_output(o, _orig_cu_seqlens, cu_seqlens, T_input)
+    with jax.named_scope("kda_unalign"):
+        o = _unalign_output(o, _orig_cu_seqlens, cu_seqlens, T_input)
 
     # Release intermediates
     w, u, qg, kg, v_new, h = None, None, None, None, None, None
