@@ -1,34 +1,61 @@
 # `bts` on fused_moe v2, TPU v6e — retracted, and why
 
 **An earlier version of this document claimed `bts=64` gave a 1.37×/3.12×
-speedup. That was a measurement artefact. It does not.**
+speedup. That was a measurement artefact. It is slower at every point in the
+T × `ep` grid.**
 
 The claim came from XProf named-scope self-time. That metric turned out to be
 insensitive to how much work the kernel actually does, so it could not support
-a performance claim of any size. Wall clock, measured on a jitted call, shows
-no benefit.
+a performance claim of any size. Jitted wall clock, over 8 (tokens, `ep`)
+pairs, puts `bts=64` between 1.2% and 10.2% slower.
 
 ## What the correct measurement says
 
-GLM-4.5-Air `H=4096 F=1408 E=128 top_k=8`, `bf=128`, `ep=4`, TPU v6e-8,
-`jax 0.10.1`, bf16. Median of 10 jitted calls after 4 warm-ups.
+GLM-4.5-Air `H=4096 F=1408 E=128 top_k=8`, `bf=128`, TPU v6e-8, `jax 0.10.1`,
+bf16. Median of 10 jitted calls after 4 warm-ups. The full grid, 8 pairs:
 
-| tokens | `bts=None` (=32) | `bts=64` | |
-|---:|---:|---:|---|
-| 1024 | 10455 µs | 10578 µs | +1.2% |
-| 2048 | 18793 µs | 19291 µs | +2.6% |
+| `ep` | tokens | `bts=None` (=32) | tiles | `bts=64` | tiles | change |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 1024 | 10455 µs | 2 | 10578 µs | 1 | +1.2% |
+| 4 | 2048 | 18793 µs | 4 | 19291 µs | 2 | +2.6% |
+| 4 | 4096 | 35575 µs | 8 | 36496 µs | 4 | +2.6% |
+| 4 | 8192 | 68989 µs | 16 | 70974 µs | 8 | +2.9% |
+| 8 | 1024 | 3146 µs | 2 | 3265 µs | 1 | +3.8% |
+| 8 | 2048 | 4929 µs | 4 | 5432 µs | 2 | +10.2% |
+| 8 | 4096 | 9624 µs | 8 | 9751 µs | 4 | +1.3% |
+| 8 | 8192 | 18158 µs | 16 | 18551 µs | 8 | +2.2% |
 
-Fitting `wall = a + b·tokens` over T ∈ {1024, 2048, 4096} (residuals ±23 µs on
-10–35 ms, so the fit resolves ~0.2%):
+`bts=64` is slower at every point. It halves the tile count everywhere, so at
+T=8192 it removes eight of sixteen weight re-fetches per expert and is still
+2.9% slower — the effect does not appear at scale, it inverts.
+
+Marginal cost per token, from successive token counts at `bts=None`:
 
 ```
-bts=None    2064 µs  +  8.18 µs/token
-bts=64      1866 µs  +  8.51 µs/token
+ep=4    8.14   8.19   8.16  µs/token
+ep=8    1.74   2.29   2.08  µs/token
 ```
 
-`bts=64` trades ~200 µs of fixed cost for a 4% worse per-token slope. At
-T=1024 a 3.24× speedup would have predicted 4693 µs against a measured 10578 —
-not a subtle miss.
+`ep=4` is linear in tokens to within 0.6%.
+
+## An unexplained factor of ~1.9
+
+Doubling the EP degree at fixed token count is worth far more than any block
+config value tried here:
+
+| tokens | `ep=4` | `ep=8` | ratio |
+|---:|---:|---:|---:|
+| 1024 | 10455 µs | 3146 µs | 3.32× |
+| 2048 | 18793 µs | 4929 µs | 3.81× |
+| 4096 | 35575 µs | 9624 µs | 3.70× |
+| 8192 | 68989 µs | 18158 µs | 3.80× |
+
+Per-device work should only halve. Tokens per device halve (T/ep) and experts
+per device halve (E/ep), while **tokens per expert is invariant in ep** —
+`(T/ep)·K/(E/ep) = T·K/E`, 256 at T=4096 for both. So the expected ratio is 2×
+and the observed one is ~3.7×. The remaining ~1.9× is not accounted for by this
+measurement, and is the larger effect by an order of magnitude — worth chasing
+before any further block-config tuning.
 
 ## How the self-time metric failed
 
@@ -68,9 +95,10 @@ slice — `kernel.py:1169` says so directly:
 # Weights re-prefetch per bts tile (redundant when num_bts_tiles=1, ...
 ```
 
-With `bts=32` and ~128 tokens per local expert that is four fetches per slice.
-What is now unsupported is the claim that removing them is worth anything
-measurable at these shapes — evidently the re-fetches are already hidden.
+With `bts=32` and 256 tokens per local expert that is eight fetches per slice
+at T=4096. What the grid shows is that removing half of them costs time rather
+than saving it, at every token count and both EP degrees — so the re-fetches
+are already hidden, and the larger tile pays for itself in padding.
 
 **`TUNED_BLOCK_CONFIGS` has no `TPU v6e` section.** 48 entries, all `TPU v7`,
 all `intermediate_size=2048`, all fp8, all `ep ∈ {8,16,32,128}`. Every v6e shape
@@ -81,7 +109,8 @@ their `bf` values (256/512/1024) divides 1408, and only 256 divides 768.
 
 **`bf=1408` does not compile on v6e.** With `H=4096`, one weight tile is
 4096×1408×2 B = 11.5 MB; `w1`/`w3`/`w2` plus double-buffering exceeds the
-compiler's scoped VMEM limit, with or without `bts=64`:
+compiler's scoped VMEM limit — all 16 `bf=1408` points in the grid failed this
+way, with and without `bts=64`:
 
 ```
 E1001: CompileTimeScopedVmemOom: ... bf16[256,4096] ... bf_1408
@@ -90,17 +119,19 @@ E1001: CompileTimeScopedVmemOom: ... bf16[256,4096] ... bf_1408
 This is the scoped limit, not the 128 MB physical budget; it would need
 `--xla_tpu_scoped_vmem_limit_kib` raised to test.
 
-**Cost of the kernel at this shape.** 8.2 µs/token at `H=4096 F=1408 K=8 ep=4`.
-The per-device compute floor is 77 µs at T=1024 against 8.3 ms of variable
-wall, so the kernel runs at roughly 1% of peak MXU. That gap, not `bts`, is
-where the headroom is.
+**Cost of the kernel at this shape.** 8.16 µs/token at `ep=4`, 2.0 at `ep=8`,
+for `H=4096 F=1408 K=8`. The per-device compute floor is 77 µs at T=1024
+against 8.3 ms of variable wall, so the kernel runs at roughly 1% of peak MXU.
+That gap, not `bts`, is where the headroom is.
 
 ## Limits
 
-- One shape family (GLM-4.5-Air), one `bf` (128), one `ep` (4) so far. A sweep
-  over T ∈ {1024,2048,4096,8192} × `ep` ∈ {4,8} is running.
+- One shape family (GLM-4.5-Air) and one `bf` (128). The T × `ep` grid is
+  complete; `bf` is not swept, because the only other legal value on this shape
+  is 1408, which does not compile.
 - Weights are replicated (`P()`) rather than sharded over the EP axis, which
-  may not match how the model runs in serving. The absolute 8.2 µs/token should
-  not be read as a serving number.
+  may not match how the model runs in serving. The absolute µs/token figures
+  should not be read as serving numbers, and the unexplained ~1.9× above may
+  be an artefact of this setup rather than a property of the kernel.
 - bf16 only. The v7 table is entirely fp8.
 - Wall clock includes host dispatch; the ~2 ms intercept is not attributed.
