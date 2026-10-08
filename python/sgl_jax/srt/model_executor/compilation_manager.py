@@ -40,6 +40,7 @@ class CompilationManager:
         has_recurrent_state: bool = False,
         supports_recurrent_cow: bool = False,
         supports_recurrent_track: bool = False,
+        ple_embeddings_width: int = 0,
         moe_backend: str | None = None,
     ):
         self.dp_size = dp_size
@@ -55,6 +56,7 @@ class CompilationManager:
         self.has_recurrent_state = has_recurrent_state
         self.supports_recurrent_cow = supports_recurrent_cow
         self.supports_recurrent_track = supports_recurrent_track
+        self.ple_embeddings_width = ple_embeddings_width
         # Callers pass the *effective* backend (ModelConfig.moe_backend), which
         # resolves architectures that hard-code FusedEPMoE (e.g. Qwen3.5) to
         # "fused" so the bs-bucket filter below applies. Fall back to the raw
@@ -405,6 +407,13 @@ class CompilationManager:
             ),
             recurrent_track_mask=(
                 np.zeros(bs, dtype=np.int32) if self.supports_recurrent_track else None
+            ),
+            # Served batches carry the host-gathered N-gram rows; zeros give
+            # the dummy the same pytree.
+            ple_embeddings=(
+                np.zeros((num_tokens, self.ple_embeddings_width), dtype=jnp.bfloat16)
+                if self.ple_embeddings_width
+                else None
             ),
         )
 

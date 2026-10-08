@@ -17,6 +17,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
+from sgl_jax.srt.layers.ngram_table import get_ngram_table
 from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
@@ -261,6 +262,7 @@ class ModelWorker:
         from sgl_jax.srt.models.registry import ModelRegistry
 
         has_recurrent_state = self.model_runner.linear_recurrent_config is not None
+        ngram_table = get_ngram_table()
         use_multistage_multimodal = server_args.multimodal
         use_in_model_multimodal = (
             self.model_config.is_multimodal
@@ -297,6 +299,11 @@ class ModelWorker:
             ),
             supports_recurrent_track=(
                 has_recurrent_state and server_args.enable_recurrent_extra_buffer
+            ),
+            # Served batches carry ple_embeddings exactly when a table is
+            # installed, so warmup follows the same test.
+            ple_embeddings_width=(
+                0 if ngram_table is None else ngram_table.params.ngram_heads * ngram_table.dim
             ),
             moe_backend=effective_moe_backend,
         )
