@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
@@ -442,6 +443,26 @@ class TestDummyBatch(unittest.TestCase):
         )
         batch = cm._make_dummy_batch(32, 128, ForwardMode.EXTEND, 512)
         assert batch.capture_hidden_mode == CaptureHiddenMode.FULL
+
+    def test_ple_embeddings_follow_the_padded_token_count(self):
+        cm = CompilationManager(
+            server_args=_make_server_args(),
+            max_padded_batch_size=32,
+            max_padded_num_tokens=512,
+            dp_size=1,
+            tp_size=4,
+            page_size=128,
+            max_req_len=4096,
+            vocab_size=32000,
+            ple_embeddings_width=2560,
+        )
+        for mode, bs, num_tokens in ((ForwardMode.EXTEND, 32, 128), (ForwardMode.DECODE, 16, 16)):
+            batch = cm._make_dummy_batch(bs, num_tokens, mode, 512)
+            assert batch.ple_embeddings.shape == (num_tokens, 2560)
+            assert batch.ple_embeddings.dtype == jnp.bfloat16
+            assert not batch.ple_embeddings.any()
+
+        assert self.cm._make_dummy_batch(32, 128, ForwardMode.EXTEND, 512).ple_embeddings is None
 
     def test_precompile_extend_uses_one_unified_multimodal_signature(self):
         cm = CompilationManager(
